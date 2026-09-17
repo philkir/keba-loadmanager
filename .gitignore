@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.wrangler/
+.env
+.dev.vars
+.venv/
+data/
+__pycache__/
+.pytest_cache/
+*.sqlite*
+playwright-report/
+test-results/
+deploy/backend.env
+deploy/secrets/*
+!deploy/secrets/.gitkeep
+!deploy/secrets/*.example

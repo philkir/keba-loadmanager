@@ -1,0 +1,56 @@
+name: keba-loadmanager
+
+services:
+  backend:
+    image: ${KEBA_IMAGE:-keba-loadmanager:0.1.0}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ./deploy/backend.env
+    volumes:
+      - keba-data:/var/lib/keba
+      - ./deploy/config/stations.json:/etc/keba/stations.json:ro
+    ports:
+      - "127.0.0.1:${KEBA_BACKEND_PORT:-8000}:8000"
+      - "127.0.0.1:${KEBA_WEB_PORT:-8080}:8080"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - keba-internal
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.9.1
+    profiles:
+      - tunnel
+    command: tunnel --no-autoupdate run --token-file /run/secrets/cloudflared_token
+    depends_on:
+      backend:
+        condition: service_healthy
+    secrets:
+      - cloudflared_token
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - keba-internal
+
+networks:
+  keba-internal:
+
+volumes:
+  keba-data:
+
+secrets:
+  cloudflared_token:
+    file: ./deploy/secrets/cloudflared-token.txt

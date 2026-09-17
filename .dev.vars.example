@@ -1,0 +1,6 @@
+# Only for wrangler dev; create .dev.vars locally. Never commit secrets.
+LOCAL_DEV=true
+BACKEND_ORIGIN=http://127.0.0.1:8000
+BACKEND_TOKEN=replace-with-API_TOKEN-from-local-env
+CF_ACCESS_CLIENT_ID=unused-locally
+CF_ACCESS_CLIENT_SECRET=unused-locally

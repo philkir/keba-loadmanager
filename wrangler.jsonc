@@ -1,0 +1,12 @@
+{
+  "name": "keba-loadmanager",
+  "account_id": "abbebcf7b28fad1e005c1d61d2d27ebc",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-16",
+  "workers_dev": true,
+  "preview_urls": false,
+  "assets": {"directory":"./dist","binding":"ASSETS","not_found_handling":"single-page-application","run_worker_first":true},
+  "vars": {"BACKEND_ORIGIN":"", "ACCESS_TEAM_DOMAIN":"", "ACCESS_AUD":"", "LOCAL_DEV":"false"},
+  "secrets": {"required":["BACKEND_TOKEN", "CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET"]},
+  "observability": {"enabled":true,"logs":{"enabled":true,"head_sampling_rate":1},"traces":{"enabled":true,"head_sampling_rate":0.1}}
+}

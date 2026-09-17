@@ -1,0 +1,8 @@
+{
+  "stations": [
+    {"id":"cp-1","name":"Ladepunkt 01","model":"P30 x","host":"192.168.1.71","port":502,"device_id":255,"max_current_a":16,"priority":"normal","paused":false},
+    {"id":"cp-2","name":"Ladepunkt 02","model":"P40","host":"192.168.1.72","port":502,"device_id":255,"max_current_a":16,"priority":"normal","paused":false},
+    {"id":"cp-3","name":"Ladepunkt 03","model":"P40","host":"192.168.1.73","port":502,"device_id":255,"max_current_a":16,"priority":"normal","paused":false},
+    {"id":"cp-4","name":"Ladepunkt 04","model":"P40","host":"192.168.1.74","port":502,"device_id":255,"max_current_a":16,"priority":"normal","paused":false}
+  ]
+}
