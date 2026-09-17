@@ -4,7 +4,9 @@
 
 Lokales Lastmanagement und Inbetriebnahme-Dashboard für eine KEBA P30 x-series und drei KEBA P40. Die Anwendung liest die Ladestationen über Modbus TCP, speichert Zustände und Ereignisse lokal in SQLite und kann unabhängig von der OCPP-Anbindung an Monta betrieben werden.
 
-> **Aktueller Stand:** Der MVP läuft im Modus `commissioning`. Er liest echte Geräte, führt aber noch keine Modbus-Schreibzugriffe oder automatische Leistungsregelung aus. Dafür fehlen insbesondere die Einbindung des Gebäudeverbrauchszählers, die abschließende Registervalidierung und eine kontrollierte Freigabe des Regelbetriebs.
+> **Verbindliches Regelziel:** Im Regelbetrieb ist der eingestellte Maximalwert die feste Obergrenze für Gebäude und Ladestationen zusammen. Der Controller berechnet fortlaufend `Ladebudget = Maximalwert − Gebäudeverbrauch − Regelreserve` und verteilt dieses Budget auf die verbundenen Fahrzeuge. Sinkt der Gebäudeverbrauch, wird die Ladeleistung wieder bis zum verfügbaren Maximalwert angehoben. Fehlt ein aktueller Gebäudemesswert, setzt der Controller alle Ladefreigaben auf 0 A.
+>
+> **Aktueller Softwarestand:** Der Modus `commissioning` dient ausschließlich der Inbetriebnahme. Er liest die echten Geräte, schreibt aber noch keine Modbus-Register. Vor dem Wechsel in den Regelbetrieb muss deshalb der Gebäudeverbrauchszähler angebunden und geprüft werden; ohne dessen Messwerte lässt sich die gemeinsame Anschlussgrenze nicht zuverlässig einhalten.
 
 ## Funktionen
 
@@ -12,6 +14,8 @@ Lokales Lastmanagement und Inbetriebnahme-Dashboard für eine KEBA P30 x-series 
 - FastAPI-Backend mit getrenntem Web-Gateway, öffentlicher API und internem Controller
 - Modbus-TCP-Abfrage von KEBA P30 x-series und P40
 - Persistente lokale Konfiguration und Historie in SQLite
+- Phasenbewusste Verteilung des verfügbaren Ladebudgets bis zur eingestellten Anschlussgrenze
+- Sicherer Halt mit 0 A bei fehlender oder veralteter Gebäudemessung
 - Komplett-Image für `amd64` und `arm64`, auf dem Zielgerät baubar
 - Docker Compose mit optionalem Cloudflare-Tunnel
 - Weiterbetrieb der Monta-Anbindung für Autorisierung und Abrechnung über OCPP
@@ -133,6 +137,8 @@ DOCKER.md                Ausführliche Betriebs- und Tunnelanleitung
 ```
 
 ## Geplanter Regelbetrieb
+
+Der Regelalgorithmus behandelt `power_limit_kw` als harte Obergrenze. Er versucht innerhalb dieser Grenze stets, die maximal verfügbare Ladeleistung zu nutzen. Gebäudelast und separat eingestellte Regelreserve haben Vorrang; die verbleibende Leistung wird fair und phasenbewusst auf die aktiven Ladepunkte verteilt.
 
 Vor der Aktivierung von Modbus-Schreibzugriffen sind mindestens folgende Schritte vorgesehen:
 
