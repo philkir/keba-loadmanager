@@ -28,17 +28,49 @@ class KebaModbus:
     async def connect(self):
         if not await self.client.connect():raise ConnectionError('Wallbox nicht erreichbar')
 
-    async def telemetry(self):
-        # Sequential requests on one Modbus connection. Never run a second poller
-        # independently of the controller: reads can reset the device watchdog.
-        return {'state':await self.read32(1000),
+    def firmware_version(self, raw):
+        if self.model == 'P40':
+            return f'{raw // 10000}.{raw // 100 % 100}.{raw % 100}'
+        return '.'.join(str((raw >> shift) & 0xff) for shift in (24, 16, 8))
+
+    async def optional32(self, register):
+        try:
+            return await self.read32(register)
+        except Exception:
+            return None
+
+    async def telemetry(self, full=False):
+        """Read operational data; full adds slower device and capability registers."""
+        # Keep all requests on this single connection: reads also feed the device watchdog.
+        state = await self.read32(1000)
+        data = {'state':state,
                 'cable_state':await self.read32(1004),
                 'error_code':await self.read32(1006),
                 'currents_a':[await self.read32(r)/1000 for r in [1008,1010,1012]],
-                'serial':await self.read32(1014),
-                'firmware_raw':await self.read32(1018),
                 'power_kw':await self.read32(1020)/1_000_000,
-                'energy_kwh':await self.read32(1036)/10_000}
+                'energy_kwh':await self.read32(1036)/10_000,
+                'session_kwh':(await self.read32(1502))/10_000}
+        if not full:
+            return data
+        raw = {register: await self.optional32(register) for register in
+               [1014,1016,1018,1040,1042,1044,1046,1100,1110,1500,1550,1552,1600,1602]}
+        if self.model == 'P40':
+            raw.update({register: await self.optional32(register) for register in [1200,1700,1702]})
+        data.update({
+            'serial':raw[1014], 'product_raw':raw[1016], 'firmware_raw':raw[1018],
+            'firmware':self.firmware_version(raw[1018]) if raw[1018] is not None else None,
+            'voltages_v':[raw[r] for r in [1040,1042,1044]],
+            'power_factor_pct':raw[1046]/10 if raw[1046] is not None else None,
+            'device_limit_a':raw[1100]/1000 if raw[1100] is not None else None,
+            'hardware_limit_a':raw[1110]/1000 if raw[1110] is not None else None,
+            'phase_switch_source':raw[1550], 'phase_count':raw[1552],
+            'rfid_uid':f'{raw[1500]:08X}' if raw[1500] is not None else None,
+            'failsafe_current_a':raw[1600]/1000 if raw[1600] is not None else None,
+            'failsafe_timeout_s':raw[1602],
+            'fast_charging':bool(raw.get(1200)) if raw.get(1200) is not None else None,
+            'hardware_revision':raw.get(1700), 'meter_hardware_revision':raw.get(1702),
+        })
+        return data
 
     async def set_limit(self, amps):
         if amps != 0 and not 6<=amps<=self.max_current_a:raise ValueError('Ungültiges Stromlimit')

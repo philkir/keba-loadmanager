@@ -1,6 +1,7 @@
 """Single-owner simulation controller; runs separately from the public API."""
 import asyncio
 import hmac
+import math
 import os
 import time
 import uuid
@@ -23,6 +24,8 @@ class Controller:
         defaults = {s['id']: s for s in configured}
         stored = store.get('stations', configured)
         self.station_config = [StationSetting.model_validate({**defaults.get(s.get('id'), {}), **s}).model_dump() for s in stored]
+        for station in self.station_config:
+            station['max_current_a'] = defaults.get(station['id'], station)['max_current_a']
         self.sim = Simulation()  # Fault injection is deliberately reset after a restart.
         self.state = None
         self.last_sample = 0
@@ -151,11 +154,15 @@ class CommissioningController:
         defaults = {s['id']: s for s in configured}
         stored = store.get('stations', configured)
         self.station_config = [StationSetting.model_validate({**defaults.get(s.get('id'), {}), **s}).model_dump() for s in stored]
+        for station in self.station_config:
+            station['max_current_a'] = defaults.get(station['id'], station)['max_current_a']
         self.sim = Simulation(building_kw=0, meter_online=False, disconnected=[], offline=[])
         self.state = None
         self.revision = int(store.get('revision', 0))
         self.lock = asyncio.Lock()
         self.last_snapshot = None
+        self.telemetry_cache = {}
+        self.last_full_read = {}
 
     async def probe(self, setting):
         station = {**setting, 'connected':False, 'online':False, 'network_online':False,
@@ -178,12 +185,21 @@ class CommissioningController:
                             max_current_a=setting['max_current_a'])
         try:
             await wallbox.connect()
-            data = await wallbox.telemetry()
+            full = time.monotonic()-self.last_full_read.get(setting['id'], 0) >= 60
+            data = await wallbox.telemetry(full=full)
+            if full:
+                self.telemetry_cache[setting['id']] = data.copy()
+                self.last_full_read[setting['id']] = time.monotonic()
+            else:
+                data = {**self.telemetry_cache.get(setting['id'], {}), **data}
             station.update(data)
+            station['installation_limit_a'] = setting['max_current_a']
+            reported_limits = [value for value in (data.get('device_limit_a'), data.get('hardware_limit_a'))
+                               if value is not None and value >= 6]
+            station['max_current_a'] = min([setting['max_current_a'], *reported_limits])
             station['online'] = True
             station['connected'] = data['cable_state'] in (5, 7)
             station['current_a'] = round(max(data['currents_a']), 3)
-            station['session_kwh'] = round(data['energy_kwh'], 3)
             station['status'] = ('charging' if data['state'] == 3 else 'safe' if data['state'] == 4
                                  else 'paused' if data['state'] == 5 else 'waiting' if data['state'] == 2
                                  else 'available')
@@ -249,6 +265,13 @@ class CommissioningController:
                     key, data = 'stations', [{**s, **patch} if s['id'] == station_id else s.copy() for s in self.station_config]
                     data = [StationSetting.model_validate(s).model_dump() for s in data]
                     message = f'Verbindungsdaten für {station_id} aktualisiert.'
+                elif kind == 'start' and hasattr(self, 'manual_start_until'):
+                    station_id = body.get('station_id')
+                    if station_id not in [s['id'] for s in self.station_config]:
+                        raise HTTPException(404, 'Ladepunkt nicht gefunden.')
+                    key = 'stations'
+                    data = [{**s, 'paused':False} if s['id'] == station_id else s.copy() for s in self.station_config]
+                    message = f'Manuelle Ladeanforderung für {station_id} aktiviert.'
                 else:
                     raise HTTPException(422, 'Im Inbetriebnahmemodus sind nur lokale Einstellungen erlaubt.')
             except ValidationError as exc:
@@ -256,7 +279,10 @@ class CommissioningController:
             result = {'ok':True, 'id':command_id, 'applied_at':time.time()}
             await asyncio.to_thread(self.store.commit_command, key, data, command_id, result, message)
             if kind == 'settings': self.settings = Settings.model_validate(data)
-            else: self.station_config = data
+            else:
+                self.station_config = data
+                if kind == 'start':
+                    self.manual_start_until[station_id] = time.monotonic()+max(300, self.settings.rotation_seconds)
             self.revision += 1
             await self.tick()
             return result
@@ -267,10 +293,16 @@ class ActiveController(CommissioningController):
     def __init__(self, store):
         super().__init__(store)
         self.failsafe_ready = set()
+        self.applied_limits = {}
+        self.manual_start_until = {}
+        self.limit_changed_at = {}
+        self.underuse_since = {}
         self.last_condition = None
         self.last_sample = 0
 
     async def apply_limit(self, setting, amps):
+        if setting['id'] in self.failsafe_ready and self.applied_limits.get(setting['id']) == amps:
+            return None
         wallbox = KebaModbus(setting['host'], setting['model'], port=setting['port'],
                             device_id=setting['device_id'], writes_enabled=True,
                             max_current_a=setting['max_current_a'])
@@ -280,19 +312,57 @@ class ActiveController(CommissioningController):
                 await wallbox.configure_failsafe(timeout=10)
                 self.failsafe_ready.add(setting['id'])
             await wallbox.set_limit(amps)
+            self.applied_limits[setting['id']] = amps
+            self.limit_changed_at[setting['id']] = time.monotonic()
             return None
         except Exception as exc:
             self.failsafe_ready.discard(setting['id'])
+            self.applied_limits.pop(setting['id'], None)
             return str(exc)
         finally:
             wallbox.close()
+
+    def adaptive_cap(self, station, mono):
+        """Reclaim stable unused current without reacting to normal vehicle ramp-up."""
+        station_id = station['id']
+        maximum = station['max_current_a']
+        commanded = self.applied_limits.get(station_id)
+        measured = max(station.get('currents_a') or [0])
+        station['unused_grant_a'] = round(max(0, (commanded or 0)-measured), 3)
+        if (commanded is None or commanded < 6 or station.get('state') != 3
+                or mono-self.limit_changed_at.get(station_id, mono) < 12):
+            self.underuse_since.pop(station_id, None)
+            station['adaptive_limit_a'] = maximum
+            return maximum
+        if measured >= commanded-0.5:
+            self.underuse_since.pop(station_id, None)
+            station['adaptive_limit_a'] = maximum
+            return maximum
+        if measured < commanded-0.9:
+            since = self.underuse_since.setdefault(station_id, mono)
+            if mono-since >= 10:
+                cap = min(maximum, max(6, math.ceil(measured+0.5)))
+                station['adaptive_limit_a'] = cap
+                return cap
+        else:
+            self.underuse_since.pop(station_id, None)
+        station['adaptive_limit_a'] = maximum
+        return maximum
 
     async def tick(self):
         now, mono = time.time(), time.monotonic()
         stations = await asyncio.gather(*(self.probe(s) for s in self.station_config))
         building_kw = self.settings.fallback_building_kw
         building_a = [building_kw * 1000 / 690] * 3
-        grants = allocate(stations, building_a, building_kw, self.settings, mono)
+        self.manual_start_until = {station_id:until for station_id,until in self.manual_start_until.items() if until > mono}
+        allocation_stations = []
+        for station in stations:
+            cap = self.adaptive_cap(station, mono)
+            allocation_stations.append({**station, 'max_current_a':cap,
+                                        'priority':'high' if station['id'] in self.manual_start_until else station['priority']})
+        allocation_stations.sort(key=lambda station:self.manual_start_until.get(station['id'], 0), reverse=True)
+        grants = allocate(allocation_stations, building_a, building_kw, self.settings,
+                          0 if self.manual_start_until else mono)
         limits = [0 if self.settings.paused or s['paused'] or not s['connected'] else grants[s['id']]
                   for s in stations]
         results = await asyncio.gather(*(self.apply_limit(s, limit) if s['online'] else asyncio.sleep(0, result='nicht erreichbar')
@@ -306,7 +376,13 @@ class ActiveController(CommissioningController):
             elif station['connected']:
                 station['status'] = ('paused' if self.settings.paused or station['paused'] else
                                      'charging' if station['state'] == 3 and limit else 'waiting')
-                station['connection_detail'] = f'Aktive Freigabe: {limit} A · Fallback-Gebäudelast'
+                adaptive = station.get('adaptive_limit_a', station['max_current_a'])
+                detail = f'Aktive Freigabe: {limit} A · Fallback-Gebäudelast'
+                if adaptive < station['max_current_a']:
+                    detail += f' · Fahrzeugbedarf auf {adaptive} A erkannt'
+                station['connection_detail'] = detail
+                station['failsafe_current_a'] = 0
+                station['failsafe_timeout_s'] = 10
 
         charging = round(sum(s['power_kw'] for s in stations), 3)
         estimated_charging = round(sum(limit * 690 / 1000 for limit in limits), 3)
@@ -331,6 +407,7 @@ class ActiveController(CommissioningController):
             'meter_online':False, 'building_source':'fallback', 'revision':self.revision,
             'overload':total > self.settings.power_limit_kw or any(x > self.settings.phase_limit_a for x in phases),
             'monta_status':'external_unverified', 'commissioned':True,
+            'manual_start_ids':list(self.manual_start_until),
         }
         if now-self.last_sample >= 5:
             await asyncio.to_thread(self.store.sample, now, building_kw, charging)

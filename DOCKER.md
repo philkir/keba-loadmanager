@@ -12,6 +12,8 @@ Die Stationsdaten stehen in `deploy/config/stations.json`. Das Image läuft als 
 
 Neue Konfigurationen starten mit `MODE=active`. Dabei schreibt der Regler die berechneten Stromlimits per Modbus und verwendet ohne Gebäudenzähler die in der Oberfläche konfigurierte Fallback-Gebäudelast (Standard: 8 kW). Dieser Wert muss mindestens so hoch wie der maximal gleichzeitig zu erwartende Gebäudeverbrauch gewählt werden. `MODE=commissioning` hält Modbus im Nur-Lese-Modus.
 
+Die mitgelieferte Installation ist für 32 A beziehungsweise 22 kW je Ladepunkt konfiguriert. Der tatsächlich freigegebene Strom ist stets das Minimum aus Installationslimit, von der Wallbox gemeldetem Hardwarelimit und dem verfügbaren Standortbudget. Nimmt ein Fahrzeug seine Freigabe stabil nicht vollständig ab, gibt der Regler den ungenutzten Anteil nach einer Anlauf- und Hysteresezeit für andere Fahrzeuge frei.
+
 ## Lokal starten
 
 Im Projektverzeichnis:

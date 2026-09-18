@@ -23,7 +23,7 @@ class StationSetting(StrictModel):
     id: str
     name: str
     model: Literal['P30 x', 'P40']
-    max_current_a: int = Field(default=16, ge=6, le=16)
+    max_current_a: int = Field(default=32, ge=6, le=32)
     priority: Literal['normal', 'high'] = 'normal'
     paused: bool = False
     host: str = ''
@@ -46,7 +46,7 @@ class StationPatch(StrictModel):
     model: Literal['P30 x', 'P40'] | None = None
     priority: Literal['normal', 'high'] | None = None
     paused: bool | None = None
-    max_current_a: int | None = Field(default=None, ge=6, le=16)
+    max_current_a: int | None = Field(default=None, ge=6, le=32)
     host: str | None = None
     port: int | None = Field(default=None, ge=1, le=65535)
     device_id: int | None = Field(default=None, ge=0, le=255)

@@ -11,10 +11,13 @@ Lokales Lastmanagement und Inbetriebnahme-Dashboard für eine KEBA P30 x-series 
 - React-Dashboard mit Live-Status, Leistungswerten und Ereignisprotokoll
 - FastAPI-Backend mit getrenntem Web-Gateway, öffentlicher API und internem Controller
 - Modbus-TCP-Abfrage von KEBA P30 x-series und P40
+- Vollständige Betriebs- und Gerätetelemetrie: Phasenströme, Spannungen, Leistungsfaktor, Geräte- und Hardwarelimit, Sitzung, RFID-UID, Firmware, Phasen- und Failsafe-Status
 - Persistente lokale Konfiguration und Historie in SQLite
 - Phasenbewusste Verteilung des verfügbaren Ladebudgets bis zur eingestellten Anschlussgrenze
 - Konfigurierbare Fallback-Gebäudelast für den Betrieb ohne Strommessung
 - Aktive Modbus-Leistungsfreigaben mit 10-Sekunden-Geräte-Failsafe
+- Adaptive Rückgewinnung ungenutzter Ladefreigabe mit Anlaufzeit und Hysterese
+- Manuelle Ladeanforderung im Dashboard innerhalb aller Anschluss- und Phasengrenzen
 - Komplett-Image für `amd64` und `arm64`, auf dem Zielgerät baubar
 - Docker Compose mit optionalem Cloudflare-Tunnel
 - Weiterbetrieb der Monta-Anbindung für Autorisierung und Abrechnung über OCPP
