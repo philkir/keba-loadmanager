@@ -262,15 +262,90 @@ class CommissioningController:
             return result
 
 
+class ActiveController(CommissioningController):
+    """Live controller using a conservative configured load when no site meter exists."""
+    def __init__(self, store):
+        super().__init__(store)
+        self.failsafe_ready = set()
+        self.last_condition = None
+        self.last_sample = 0
+
+    async def apply_limit(self, setting, amps):
+        wallbox = KebaModbus(setting['host'], setting['model'], port=setting['port'],
+                            device_id=setting['device_id'], writes_enabled=True,
+                            max_current_a=setting['max_current_a'])
+        try:
+            await wallbox.connect()
+            if setting['id'] not in self.failsafe_ready:
+                await wallbox.configure_failsafe(timeout=10)
+                self.failsafe_ready.add(setting['id'])
+            await wallbox.set_limit(amps)
+            return None
+        except Exception as exc:
+            self.failsafe_ready.discard(setting['id'])
+            return str(exc)
+        finally:
+            wallbox.close()
+
+    async def tick(self):
+        now, mono = time.time(), time.monotonic()
+        stations = await asyncio.gather(*(self.probe(s) for s in self.station_config))
+        building_kw = self.settings.fallback_building_kw
+        building_a = [building_kw * 1000 / 690] * 3
+        grants = allocate(stations, building_a, building_kw, self.settings, mono)
+        limits = [0 if self.settings.paused or s['paused'] or not s['connected'] else grants[s['id']]
+                  for s in stations]
+        results = await asyncio.gather(*(self.apply_limit(s, limit) if s['online'] else asyncio.sleep(0, result='nicht erreichbar')
+                                         for s, limit in zip(stations, limits)))
+        for station, limit, error in zip(stations, limits, results):
+            station['commanded_current_a'] = limit
+            station['control_error'] = error
+            if error:
+                station['status'] = 'offline' if not station['online'] else 'safe'
+                station['connection_detail'] = ('Keine Regelverbindung: ' + error)[:180]
+            elif station['connected']:
+                station['status'] = 'paused' if self.settings.paused or station['paused'] else ('charging' if limit else 'waiting')
+                station['connection_detail'] = f'Aktive Freigabe: {limit} A · Fallback-Gebäudelast'
+
+        charging = round(sum(s['power_kw'] for s in stations), 3)
+        estimated_charging = round(sum(limit * 690 / 1000 for limit in limits), 3)
+        total = round(building_kw + charging, 3)
+        phases = [round(building_a[p] + sum(s['currents_a'][p] for s in stations), 3) for p in range(3)]
+        errors = sum(bool(error) for error in results)
+        condition = 'paused' if self.settings.paused else 'degraded' if errors else 'active'
+        if condition != self.last_condition:
+            messages = {
+                'active': 'Aktive lokale Regelung mit Fallback-Gebäudelast.',
+                'paused': 'Alle Ladepunkte wurden aktiv auf 0 A gesetzt.',
+                'degraded': f'Regelung eingeschränkt: {errors} Ladepunkt(e) nicht steuerbar.',
+            }
+            await asyncio.to_thread(self.store.event, messages[condition], 'warning' if errors else 'info')
+            self.last_condition = condition
+        self.state = {
+            'mode':'active', 'status':condition, 'timestamp':now, 'meter_timestamp':0,
+            'site_name':self.settings.site_name, 'settings':self.settings.model_dump(), 'stations':stations,
+            'simulation':self.sim.model_dump(), 'building_kw':building_kw, 'charging_kw':charging,
+            'estimated_charging_kw':estimated_charging, 'total_kw':total, 'phase_currents_a':phases,
+            'headroom_kw':round(max(0, self.settings.power_limit_kw-self.settings.reserve_kw-building_kw-charging), 3),
+            'meter_online':False, 'building_source':'fallback', 'revision':self.revision,
+            'overload':total > self.settings.power_limit_kw or any(x > self.settings.phase_limit_a for x in phases),
+            'monta_status':'external_unverified', 'commissioned':True,
+        }
+        if now-self.last_sample >= 5:
+            await asyncio.to_thread(self.store.sample, now, building_kw, charging)
+            self.last_sample = now
+
+
 @asynccontextmanager
 async def lifespan(app):
     mode = os.getenv('MODE', 'simulation')
-    if mode not in ('simulation', 'commissioning'):
-        raise RuntimeError('MODE muss simulation oder commissioning sein.')
+    if mode not in ('simulation', 'commissioning', 'active'):
+        raise RuntimeError('MODE muss simulation, commissioning oder active sein.')
     if len(os.getenv('CONTROLLER_TOKEN','')) < 24:
         raise RuntimeError('CONTROLLER_TOKEN mit mindestens 24 Zeichen erforderlich.')
     store = Store(os.getenv('DB_PATH','data/loadmanager.sqlite'))
-    app.state.controller = Controller(store) if mode == 'simulation' else CommissioningController(store)
+    controllers = {'simulation': Controller, 'commissioning': CommissioningController, 'active': ActiveController}
+    app.state.controller = controllers[mode](store)
     await app.state.controller.tick()
     task = asyncio.create_task(app.state.controller.run())
     app.state.task = task

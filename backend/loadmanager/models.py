@@ -14,6 +14,7 @@ class Settings(StrictModel):
     power_limit_kw: float = Field(default=25, ge=5, le=25)
     phase_limit_a: float = Field(default=35, ge=6, le=35)
     reserve_kw: float = Field(default=1, ge=0.5, le=5)
+    fallback_building_kw: float = Field(default=8, ge=0, le=20)
     rotation_seconds: int = Field(default=120, ge=30, le=900)
     paused: bool = False
 

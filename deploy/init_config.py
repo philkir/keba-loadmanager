@@ -21,11 +21,11 @@ if source.exists():
             existing[key] = value
 
 values = {
-    'MODE': 'commissioning',
+    'MODE': 'active',
     'API_TOKEN': existing.get('API_TOKEN') or secrets.token_urlsafe(32),
     'CONTROLLER_TOKEN': existing.get('CONTROLLER_TOKEN') or secrets.token_urlsafe(32),
     'CONTROLLER_URL': 'http://127.0.0.1:8091',
-    'DB_PATH': '/var/lib/keba/commissioning.sqlite',
+    'DB_PATH': '/var/lib/keba/loadmanager.sqlite',
     'STATIONS_CONFIG_PATH': '/etc/keba/stations.json',
     'WEB_ALLOWED_ORIGINS': '',
 }
