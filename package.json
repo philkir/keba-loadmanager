@@ -1,5 +1,5 @@
 {
-  "name": "keba-loadmanager", "version": "0.1.0", "private": true, "type": "module",
+  "name": "keba-loadmanager", "version": "0.2.0", "private": true, "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1", "build": "tsc --noEmit && vite build",
     "check": "tsc --noEmit", "cf:types": "wrangler types",

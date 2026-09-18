@@ -4,9 +4,7 @@
 
 Lokales Lastmanagement und Inbetriebnahme-Dashboard für eine KEBA P30 x-series und drei KEBA P40. Die Anwendung liest die Ladestationen über Modbus TCP, speichert Zustände und Ereignisse lokal in SQLite und kann unabhängig von der OCPP-Anbindung an Monta betrieben werden.
 
-> **Verbindliches Regelziel:** Im Regelbetrieb ist der eingestellte Maximalwert die feste Obergrenze für Gebäude und Ladestationen zusammen. Der Controller berechnet fortlaufend `Ladebudget = Maximalwert − Gebäudeverbrauch − Regelreserve` und verteilt dieses Budget auf die verbundenen Fahrzeuge. Sinkt der Gebäudeverbrauch, wird die Ladeleistung wieder bis zum verfügbaren Maximalwert angehoben. Fehlt ein aktueller Gebäudemesswert, setzt der Controller alle Ladefreigaben auf 0 A.
->
-> **Aktueller Softwarestand:** Der Modus `commissioning` dient ausschließlich der Inbetriebnahme. Er liest die echten Geräte, schreibt aber noch keine Modbus-Register. Vor dem Wechsel in den Regelbetrieb muss deshalb der Gebäudeverbrauchszähler angebunden und geprüft werden; ohne dessen Messwerte lässt sich die gemeinsame Anschlussgrenze nicht zuverlässig einhalten.
+> **Regelprinzip:** Im aktiven Betrieb ist der eingestellte Maximalwert die Obergrenze für Gebäude und Ladestationen zusammen. Solange kein Gebäudeverbrauchszähler angebunden ist, rechnet der Controller konservativ mit dem konfigurierten Fallback-Wert: `Ladebudget = Maximalwert − Fallback-Gebäudelast − Regelreserve`. Der Fallback muss mindestens dem plausiblen maximalen gleichzeitigen Gebäudeverbrauch entsprechen; andernfalls kann die reale Anschlussgrenze überschritten werden.
 
 ## Funktionen
 
@@ -15,7 +13,8 @@ Lokales Lastmanagement und Inbetriebnahme-Dashboard für eine KEBA P30 x-series 
 - Modbus-TCP-Abfrage von KEBA P30 x-series und P40
 - Persistente lokale Konfiguration und Historie in SQLite
 - Phasenbewusste Verteilung des verfügbaren Ladebudgets bis zur eingestellten Anschlussgrenze
-- Sicherer Halt mit 0 A bei fehlender oder veralteter Gebäudemessung
+- Konfigurierbare Fallback-Gebäudelast für den Betrieb ohne Strommessung
+- Aktive Modbus-Leistungsfreigaben mit 10-Sekunden-Geräte-Failsafe
 - Komplett-Image für `amd64` und `arm64`, auf dem Zielgerät baubar
 - Docker Compose mit optionalem Cloudflare-Tunnel
 - Weiterbetrieb der Monta-Anbindung für Autorisierung und Abrechnung über OCPP
@@ -136,15 +135,16 @@ compose.yaml             Backend, Volume und optionaler Cloudflare-Tunnel
 DOCKER.md                Ausführliche Betriebs- und Tunnelanleitung
 ```
 
-## Geplanter Regelbetrieb
+## Aktiver Regelbetrieb
 
 Der Regelalgorithmus behandelt `power_limit_kw` als harte Obergrenze. Er versucht innerhalb dieser Grenze stets, die maximal verfügbare Ladeleistung zu nutzen. Gebäudelast und separat eingestellte Regelreserve haben Vorrang; die verbleibende Leistung wird fair und phasenbewusst auf die aktiven Ladepunkte verteilt.
 
-Vor der Aktivierung von Modbus-Schreibzugriffen sind mindestens folgende Schritte vorgesehen:
+Der Standardmodus neuer Installationen ist `active`. Für Diagnosezwecke steht weiterhin `commissioning` als Nur-Lese-Modus zur Verfügung. Vor dem produktiven Einsatz sind mindestens folgende Schritte erforderlich:
 
-- Gebäudeverbrauch je Phase über einen geeigneten Energiezähler erfassen
+- Fallback-Gebäudelast konservativ auf den maximal plausiblen Verbrauch einstellen
+- Anschluss- und Phasengrenzen durch eine Elektrofachkraft prüfen
 - KEBA-Schreibregister und Gerätereaktionen für P30 und P40 separat validieren
-- sicheren Halt bei Zähler-, Netzwerk- oder Geräteausfall testen
+- 10-Sekunden-Failsafe und Verhalten bei Netzwerk- oder Geräteausfall testen
 - Mindeststrom, Phasengrenzen, Reserve und Fairness-Strategie unter realer Last prüfen
 - manuellen Rückfallbetrieb und Wiederanlauf definieren
 - Installation und Grenzwerte durch eine Elektrofachkraft abnehmen lassen

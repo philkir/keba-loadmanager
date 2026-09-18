@@ -2,7 +2,7 @@ name: keba-loadmanager
 
 services:
   backend:
-    image: ${KEBA_IMAGE:-keba-loadmanager:0.1.0}
+    image: ${KEBA_IMAGE:-keba-loadmanager:0.2.0}
     build:
       context: .
       dockerfile: Dockerfile

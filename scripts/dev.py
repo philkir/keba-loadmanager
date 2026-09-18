@@ -12,7 +12,7 @@ import time
 ROOT=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser()
 parser.add_argument('--backend-only',action='store_true')
-parser.add_argument('--mode',choices=['simulation','commissioning'])
+parser.add_argument('--mode',choices=['simulation','commissioning','active'])
 args=parser.parse_args()
 env_file=ROOT/'.env'
 if not env_file.exists():
@@ -33,7 +33,7 @@ try:
         processes.append(subprocess.Popen([sys.executable,'-m','uvicorn',f'loadmanager.{module}:app','--host','127.0.0.1','--port',port,'--no-access-log'],cwd=ROOT,env=env))
     if not args.backend_only:
         processes.append(subprocess.Popen(['npm','run','dev'],cwd=ROOT,env=env))
-    label='Inbetriebnahme' if env.get('MODE')=='commissioning' else 'Simulation'
+    label={'commissioning':'Nur-Lese-Modus','active':'Aktive Regelung'}.get(env.get('MODE'),'Simulation')
     print(f'\n{label}: http://127.0.0.1:5173 · Beenden mit Strg+C\n',flush=True)
     while all(p.poll() is None for p in processes):time.sleep(0.5)
 finally:

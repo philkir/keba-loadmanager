@@ -10,6 +10,8 @@ Das Image enthält die React-Oberfläche, das FastAPI-Gateway, den internen Regl
 
 Die Stationsdaten stehen in `deploy/config/stations.json`. Das Image läuft als Benutzer `10001`, besitzt keine Linux-Capabilities und schreibt ausschließlich in das Volume `/var/lib/keba` und nach `/tmp`.
 
+Neue Konfigurationen starten mit `MODE=active`. Dabei schreibt der Regler die berechneten Stromlimits per Modbus und verwendet ohne Gebäudenzähler die in der Oberfläche konfigurierte Fallback-Gebäudelast (Standard: 8 kW). Dieser Wert muss mindestens so hoch wie der maximal gleichzeitig zu erwartende Gebäudeverbrauch gewählt werden. `MODE=commissioning` hält Modbus im Nur-Lese-Modus.
+
 ## Lokal starten
 
 Im Projektverzeichnis:
@@ -19,6 +21,14 @@ python3 deploy/init_config.py
 docker compose up -d --build backend
 docker compose ps
 ```
+
+Bei einer bestehenden Installation muss der Modus einmalig in `deploy/backend.env` umgestellt werden:
+
+```text
+MODE=active
+```
+
+Anschließend `docker compose up -d --build --force-recreate backend` ausführen und den Fallback-Wert in **Einstellungen** prüfen.
 
 Danach sind verfügbar:
 
@@ -127,4 +137,4 @@ docker compose --profile tunnel up -d
 
 ## Wichtiger Betriebsstand
 
-Der aktuelle Modus `commissioning` liest die KEBA-Geräte über Modbus TCP. Schreibzugriffe und die automatische Leistungsregelung bleiben gesperrt, bis der Gebäudemesswert eingebunden und der Regelbetrieb separat freigegeben wurde. Monta und OCPP bleiben davon unabhängig.
+Der Modus `active` schreibt die berechneten Leistungsfreigaben über Modbus TCP. Ohne Gebäudemessung ist die Einhaltung der realen Anschlussgrenze nur so konservativ wie der eingestellte Fallback-Wert. Der Modus `commissioning` bleibt als vollständig schreibgeschützter Diagnosemodus erhalten. Monta und OCPP bleiben davon unabhängig.
