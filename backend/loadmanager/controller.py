@@ -304,7 +304,8 @@ class ActiveController(CommissioningController):
                 station['status'] = 'offline' if not station['online'] else 'safe'
                 station['connection_detail'] = ('Keine Regelverbindung: ' + error)[:180]
             elif station['connected']:
-                station['status'] = 'paused' if self.settings.paused or station['paused'] else ('charging' if limit else 'waiting')
+                station['status'] = ('paused' if self.settings.paused or station['paused'] else
+                                     'charging' if station['state'] == 3 and limit else 'waiting')
                 station['connection_detail'] = f'Aktive Freigabe: {limit} A · Fallback-Gebäudelast'
 
         charging = round(sum(s['power_kw'] for s in stations), 3)
