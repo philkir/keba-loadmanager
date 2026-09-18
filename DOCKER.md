@@ -119,13 +119,13 @@ docker run --rm -v keba-loadmanager_keba-data:/data -v "$PWD:/backup" alpine \
 docker compose start backend
 ```
 
-Für ein anderes Gerät mit Internetzugang genügt es, den Projektordner zu kopieren und dort `python3 deploy/init_config.py` sowie `docker compose up -d --build backend` auszuführen. Docker lädt automatisch die zum Gerät passende `amd64`- oder `arm64`-Basis. Das auf diesem Mac bereits gebaute lokale Komplett-Image ist `keba-loadmanager:0.1.0`.
+Für ein anderes Gerät mit Internetzugang genügt es, den Projektordner zu kopieren und dort `python3 deploy/init_config.py` sowie `docker compose up -d --build backend` auszuführen. Docker lädt automatisch die zum Gerät passende `amd64`- oder `arm64`-Basis. Das lokal gebaute Komplett-Image ist `keba-loadmanager:0.2.0`.
 
 Ein Offline-Paket für dieselbe Prozessorarchitektur kann so erzeugt werden:
 
 ```bash
 docker save -o keba-loadmanager-images.tar \
-  keba-loadmanager:0.1.0 cloudflare/cloudflared:2026.9.1
+  keba-loadmanager:0.2.0 cloudflare/cloudflared:2026.9.1
 ```
 
 Auf dem Zielgerät:
