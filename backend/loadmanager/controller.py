@@ -283,6 +283,7 @@ class CommissioningController:
                 self.station_config = data
                 if kind == 'start':
                     self.manual_start_until[station_id] = time.monotonic()+max(300, self.settings.rotation_seconds)
+                    self.waiting_since.pop(station_id, None)
             self.revision += 1
             await self.tick()
             return result
@@ -290,6 +291,9 @@ class CommissioningController:
 
 class ActiveController(CommissioningController):
     """Live controller using a conservative configured load when no site meter exists."""
+    waiting_grace_s = 30
+    waiting_probe_s = 12
+
     def __init__(self, store):
         super().__init__(store)
         self.failsafe_ready = set()
@@ -297,6 +301,7 @@ class ActiveController(CommissioningController):
         self.manual_start_until = {}
         self.limit_changed_at = {}
         self.underuse_since = {}
+        self.waiting_since = {}
         self.last_condition = None
         self.last_sample = 0
 
@@ -349,6 +354,33 @@ class ActiveController(CommissioningController):
         station['adaptive_limit_a'] = maximum
         return maximum
 
+    def waiting_cap(self, station, mono):
+        """Briefly offer 6 A, then reclaim capacity from a non-requesting EV.
+
+        IEC 61851 needs at least 6 A to signal that charging is available. A
+        permanent offer would reserve capacity for a sleeping or full vehicle,
+        so short periodic probes let it wake again without starving sessions
+        which are already drawing power.
+        """
+        station_id = station['id']
+        if station.get('state') != 2 or not station.get('connected'):
+            self.waiting_since.pop(station_id, None)
+            station['waiting_reclaimed'] = False
+            return None
+        since = self.waiting_since.setdefault(station_id, mono)
+        elapsed = max(0, mono-since)
+        if elapsed < self.waiting_grace_s:
+            cap = 6
+        else:
+            # A manual start is a bounded wake-up attempt, not a long-lived
+            # reservation for a vehicle that never starts drawing current.
+            self.manual_start_until.pop(station_id, None)
+            cycle = (elapsed-self.waiting_grace_s) % self.settings.rotation_seconds
+            cap = 6 if cycle >= self.settings.rotation_seconds-self.waiting_probe_s else 0
+        station['waiting_reclaimed'] = cap == 0
+        station['waiting_probe_a'] = cap
+        return cap
+
     async def tick(self):
         now, mono = time.time(), time.monotonic()
         stations = await asyncio.gather(*(self.probe(s) for s in self.station_config))
@@ -358,7 +390,11 @@ class ActiveController(CommissioningController):
         allocation_stations = []
         for station in stations:
             cap = self.adaptive_cap(station, mono)
+            waiting_cap = self.waiting_cap(station, mono)
+            if waiting_cap is not None:
+                cap = min(cap, waiting_cap)
             allocation_stations.append({**station, 'max_current_a':cap,
+                                        'allocation_rank':2 if station.get('state') == 3 else 1,
                                         'priority':'high' if station['id'] in self.manual_start_until else station['priority']})
         allocation_stations.sort(key=lambda station:self.manual_start_until.get(station['id'], 0), reverse=True)
         grants = allocate(allocation_stations, building_a, building_kw, self.settings,
@@ -378,7 +414,11 @@ class ActiveController(CommissioningController):
                                      'charging' if station['state'] == 3 and limit else 'waiting')
                 adaptive = station.get('adaptive_limit_a', station['max_current_a'])
                 detail = f'Aktive Freigabe: {limit} A · Fallback-Gebäudelast'
-                if adaptive < station['max_current_a']:
+                if station.get('waiting_reclaimed'):
+                    detail = 'Fahrzeug fordert keine Leistung an · Budget umverteilt'
+                elif station.get('state') == 2:
+                    detail = f'Startsignal: {limit} A · wartet auf Ladeanforderung des Fahrzeugs'
+                elif adaptive < station['max_current_a']:
                     detail += f' · Fahrzeugbedarf auf {adaptive} A erkannt'
                 station['connection_detail'] = detail
                 station['failsafe_current_a'] = 0

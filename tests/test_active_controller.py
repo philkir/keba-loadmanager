@@ -1,6 +1,8 @@
 import asyncio
 
 from loadmanager import controller
+from loadmanager.allocator import allocate
+from loadmanager.models import Settings
 from loadmanager.storage import Store
 
 
@@ -81,4 +83,39 @@ def test_adaptive_cap_reclaims_only_stable_unused_current(tmp_path):
     assert active.adaptive_cap(limited, mono) == 9
     assert active.adaptive_cap(requesting, mono) == 32
     assert limited['unused_grant_a'] == 1.913
+    store.db.close()
+
+
+def test_waiting_vehicle_releases_budget_and_is_probed_again(tmp_path):
+    store = Store(tmp_path / 'waiting.sqlite')
+    active = controller.ActiveController(store)
+    waiting = {'id':'cp-1', 'state':2, 'connected':True}
+
+    assert active.waiting_cap(waiting, 100) == 6
+    assert active.waiting_cap(waiting, 131) == 0
+    assert waiting['waiting_reclaimed'] is True
+    assert active.waiting_cap(
+        waiting, 100+active.waiting_grace_s+active.settings.rotation_seconds-5
+    ) == 6
+    store.db.close()
+
+
+def test_active_vehicle_gets_reclaimed_capacity(tmp_path):
+    store = Store(tmp_path / 'demand.sqlite')
+    active = controller.ActiveController(store)
+    active.waiting_since = {'cp-1':100}
+    waiting = {'id':'cp-1', 'state':2, 'connected':True, 'online':True, 'paused':False,
+               'priority':'normal', 'phases':[0,1,2], 'max_current_a':32}
+    charging = {'id':'cp-2', 'state':3, 'connected':True, 'online':True, 'paused':False,
+                'priority':'normal', 'phases':[0,1,2], 'max_current_a':16}
+    waiting['max_current_a'] = active.waiting_cap(waiting, 131)
+    waiting['allocation_rank'] = 1
+    charging['allocation_rank'] = 2
+    settings = Settings(fallback_building_kw=8)
+    building_a = [settings.fallback_building_kw*1000/690]*3
+
+    grants = allocate([waiting, charging], building_a, settings.fallback_building_kw,
+                      settings, 131)
+
+    assert grants == {'cp-1':0, 'cp-2':16}
     store.db.close()

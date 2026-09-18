@@ -17,6 +17,7 @@ Lokales Lastmanagement und Inbetriebnahme-Dashboard für eine KEBA P30 x-series 
 - Konfigurierbare Fallback-Gebäudelast für den Betrieb ohne Strommessung
 - Aktive Modbus-Leistungsfreigaben mit 10-Sekunden-Geräte-Failsafe
 - Adaptive Rückgewinnung ungenutzter Ladefreigabe mit Anlaufzeit und Hysterese
+- Bedarfserkennung für wartende Fahrzeuge: 6-A-Startsignal, danach vollständige Rückgewinnung mit regelmäßigen Weckversuchen
 - Manuelle Ladeanforderung im Dashboard innerhalb aller Anschluss- und Phasengrenzen
 - Komplett-Image für `amd64` und `arm64`, auf dem Zielgerät baubar
 - Docker Compose mit optionalem Cloudflare-Tunnel
