@@ -12,7 +12,9 @@ from pydantic import ValidationError
 
 from .allocator import allocate
 from .modbus import KebaModbus
-from .models import Settings, Simulation, StationPatch, StationSetting, station_defaults_from_file
+from .keba_rest import KebaRest, LocalStartError, LocalStartUncertain
+from .local_access import LocalAccessStore
+from .models import LocalAccess, Settings, Simulation, StationPatch, StationSetting, station_defaults_from_file
 from .storage import Store
 
 
@@ -29,6 +31,7 @@ class Controller:
         self.sim = Simulation()  # Fault injection is deliberately reset after a restart.
         self.state = None
         self.last_sample = 0
+
         self.last_meter = time.time()
         self.session_kwh = {s['id']: 0.0 for s in self.station_config}
         self.last_tick = time.monotonic()
@@ -194,9 +197,13 @@ class CommissioningController:
                 data = {**self.telemetry_cache.get(setting['id'], {}), **data}
             station.update(data)
             station['installation_limit_a'] = setting['max_current_a']
-            reported_limits = [value for value in (data.get('device_limit_a'), data.get('hardware_limit_a'))
-                               if value is not None and value >= 6]
-            station['max_current_a'] = min([setting['max_current_a'], *reported_limits])
+            # Register 1100 includes our own previous grant; using it as a
+            # capability ceiling would prevent increasing that grant again.
+            # Register 1110 accounts for DIP settings, cable and temperature.
+            hardware_limit = data.get('hardware_limit_a')
+            station['max_current_a'] = setting['max_current_a']
+            if hardware_limit is not None:
+                station['max_current_a'] = min(setting['max_current_a'], max(0, math.floor(hardware_limit)))
             station['online'] = True
             station['connected'] = data['cable_state'] in (5, 7)
             station['current_a'] = round(max(data['currents_a']), 3)
@@ -293,6 +300,8 @@ class ActiveController(CommissioningController):
     """Live controller using a conservative configured load when no site meter exists."""
     waiting_grace_s = 30
     waiting_probe_s = 12
+    failsafe_timeout_s = 10
+    control_refresh_s = 6
 
     def __init__(self, store):
         super().__init__(store)
@@ -300,29 +309,157 @@ class ActiveController(CommissioningController):
         self.applied_limits = {}
         self.manual_start_until = {}
         self.limit_changed_at = {}
+        self.control_refreshed_at = {}
         self.underuse_since = {}
+        self.demand_caps = {}
         self.waiting_since = {}
         self.last_condition = None
         self.last_sample = 0
 
+        self.local_access = LocalAccessStore(store.path.with_name('wallbox-access.json'))
+        self.local_start_tasks = {}
+        self.local_start_results = {}
+        for station in self.station_config:
+            result = store.get('local_start:' + station['id'], None)
+            if result:
+                if result['status'] == 'pending':
+                    result = {**result, 'status':'uncertain', 'ok':False,
+                              'message':'Neustart während der Startanfrage. Ladezustand vor erneutem Versuch prüfen.'}
+                    store.finish_command(result['id'], result, result['message'], 'warning',
+                                         key='local_start:' + station['id'])
+                self.local_start_results[station['id']] = result
+
+    async def command(self, body):
+        if (isinstance(body, dict) and body.get('kind') == 'station'
+                and body.get('station_id') in self.local_start_tasks
+                and isinstance(body.get('value'), dict)
+                and any(key in body['value'] for key in ('host', 'port', 'device_id', 'model'))):
+            raise HTTPException(409, 'Verbindungsdaten können während einer Startanfrage nicht geändert werden.')
+        if not isinstance(body, dict) or body.get('kind') not in ('local_access', 'local_start'):
+            return await super().command(body)
+        try:
+            command_id = str(uuid.UUID(body['id']))
+            issued = float(body['issued_at'])
+            if not time.time()-15 <= issued <= time.time()+3:
+                raise HTTPException(409, 'Befehl abgelaufen. Bitte erneut ausführen.')
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(422, 'Ungültiger Befehl.')
+        async with self.lock:
+            previous = await asyncio.to_thread(self.store.previous, command_id)
+            if previous:
+                return previous
+            station_id = body.get('station_id')
+            station = next((s for s in self.station_config if s['id'] == station_id), None)
+            if not station:
+                raise HTTPException(404, 'Ladepunkt nicht gefunden.')
+            if station_id in self.local_start_tasks:
+                raise HTTPException(409, 'Eine lokale Startanfrage läuft bereits.')
+            if body['kind'] == 'local_access':
+                try:
+                    credentials = LocalAccess.model_validate(body.get('value')).model_dump()
+                except ValidationError as exc:
+                    raise HTTPException(422, 'KEBA-Benutzername und Passwort erforderlich.') from exc
+                if not station['host']:
+                    raise HTTPException(409, 'Zuerst die lokale IP-Adresse des Ladepunkts speichern.')
+                await asyncio.to_thread(self.local_access.save, station, credentials)
+                result = {'ok':True, 'id':command_id, 'applied_at':time.time()}
+                await asyncio.to_thread(self.store.commit_command, 'local_access_updated',
+                                        result, command_id, result,
+                                        f'Lokaler KEBA-Zugang für {station_id} gespeichert.')
+            else:
+                last_start = self.local_start_results.get(station_id, {})
+                if (last_start.get('status') in ('accepted', 'uncertain')
+                        and time.time()-last_start.get('applied_at', 0) < 30):
+                    raise HTTPException(409, 'Startanfrage bereits gesendet. Bitte 30 Sekunden auf den Ladebeginn warten.')
+                if self.settings.paused or station['paused']:
+                    raise HTTPException(409, 'Pause zuerst aufheben, dann manuell starten.')
+                live = next((s for s in (self.state or {}).get('stations', []) if s['id'] == station_id), {})
+                if not self.state or time.time()-self.state['timestamp'] > 5 or not live.get('online') or live.get('control_error'):
+                    raise HTTPException(409, 'Ladepunkt hat keine aktuelle Regelverbindung.')
+                if not live.get('connected') or not live.get('serial'):
+                    raise HTTPException(409, 'Fahrzeug anschließen und Geräteerkennung abwarten.')
+                if live.get('state') == 3:
+                    raise HTTPException(409, 'Der Ladepunkt lädt bereits.')
+                if live.get('state') == 4 or live.get('error_code'):
+                    raise HTTPException(409, 'Zuerst den Gerätefehler am Ladepunkt beheben.')
+                credentials = self.local_access.get(station)
+                if not credentials:
+                    raise HTTPException(409, 'Unter Ladepunkte zuerst den lokalen KEBA-Zugang hinterlegen.')
+                result = {'ok':True, 'id':command_id, 'status':'pending',
+                          'message':'Lokaler Ladestart wird bei KEBA angefragt.', 'applied_at':time.time()}
+                await asyncio.to_thread(self.store.commit_command, 'local_start:' + station_id,
+                                        result, command_id, result,
+                                        f'Lokalen Ladestart für {station_id} angefragt.')
+                self.local_start_results[station_id] = result
+                self.local_start_tasks[station_id] = asyncio.create_task(
+                    self.local_start(station.copy(), credentials, live['serial'], command_id))
+            self.revision += 1
+            # Refresh public fields immediately; no extra Modbus cycle is needed.
+            self.publish_local_starts()
+            return result
+
+    def publish_local_starts(self):
+        for station in (self.state or {}).get('stations', []):
+            station['local_start_configured'] = bool(self.local_access.get(station))
+            station['local_start_result'] = self.local_start_results.get(station['id'])
+
+    async def local_start(self, station, credentials, serial, command_id):
+        station_id = station['id']
+        try:
+            # This runs outside the regulator lock, including network timeouts.
+            # The 6-second watchdog refresh must continue throughout login/start.
+            await asyncio.wait_for(KebaRest(station, credentials).start(serial), timeout=20)
+            status, message = 'accepted', 'Lokaler Start von KEBA akzeptiert. Ladebeginn am Messwert prüfen.'
+        except (LocalStartUncertain, asyncio.TimeoutError):
+            status, message = 'uncertain', 'Keine eindeutige KEBA-Startbestätigung. Ladezustand vor erneutem Versuch prüfen.'
+        except LocalStartError as exc:
+            status, message = 'failed', str(exc)
+        except Exception:
+            status, message = 'failed', 'Lokaler KEBA-Start fehlgeschlagen.'
+        async with self.lock:
+            result = {'id':command_id, 'ok':status == 'accepted', 'status':status,
+                      'message':message, 'applied_at':time.time()}
+            await asyncio.to_thread(self.store.finish_command, command_id, result,
+                                    f'{station_id}: {message}', 'info' if result['ok'] else 'warning',
+                                    key='local_start:' + station_id)
+            self.local_start_results[station_id] = result
+            current = next((s for s in self.station_config if s['id'] == station_id), {})
+            if result['ok'] and current == station and not self.settings.paused:
+                self.manual_start_until[station_id] = time.monotonic()+max(300, self.settings.rotation_seconds)
+                self.waiting_since.pop(station_id, None)
+            self.local_start_tasks.pop(station_id, None)
+            self.publish_local_starts()
+
     async def apply_limit(self, setting, amps):
-        if setting['id'] in self.failsafe_ready and self.applied_limits.get(setting['id']) == amps:
+        station_id = setting['id']
+        previous = self.applied_limits.get(station_id)
+        refresh_age = time.monotonic()-self.control_refreshed_at.get(station_id, float('-inf'))
+        if (station_id in self.failsafe_ready and previous == amps
+                and refresh_age < self.control_refresh_s):
             return None
         wallbox = KebaModbus(setting['host'], setting['model'], port=setting['port'],
                             device_id=setting['device_id'], writes_enabled=True,
                             max_current_a=setting['max_current_a'])
         try:
             await wallbox.connect()
-            if setting['id'] not in self.failsafe_ready:
-                await wallbox.configure_failsafe(timeout=10)
-                self.failsafe_ready.add(setting['id'])
+            if station_id not in self.failsafe_ready:
+                await wallbox.configure_failsafe(timeout=self.failsafe_timeout_s)
+                self.failsafe_ready.add(station_id)
+            else:
+                # Read traffic alone does not reliably feed the KEBA watchdog.
+                await wallbox.refresh_failsafe(timeout=self.failsafe_timeout_s)
+            # Reassert the limit and enable after a possible device-side timeout.
             await wallbox.set_limit(amps)
-            self.applied_limits[setting['id']] = amps
-            self.limit_changed_at[setting['id']] = time.monotonic()
+            self.applied_limits[station_id] = amps
+            self.control_refreshed_at[station_id] = time.monotonic()
+            # Heartbeats must not perpetually restart adaptive ramp-up timing.
+            if previous != amps or refresh_age >= self.failsafe_timeout_s:
+                self.limit_changed_at[station_id] = self.control_refreshed_at[station_id]
             return None
         except Exception as exc:
-            self.failsafe_ready.discard(setting['id'])
-            self.applied_limits.pop(setting['id'], None)
+            self.failsafe_ready.discard(station_id)
+            self.applied_limits.pop(station_id, None)
+            self.control_refreshed_at.pop(station_id, None)
             return str(exc)
         finally:
             wallbox.close()
@@ -334,8 +471,22 @@ class ActiveController(CommissioningController):
         commanded = self.applied_limits.get(station_id)
         measured = max(station.get('currents_a') or [0])
         station['unused_grant_a'] = round(max(0, (commanded or 0)-measured), 3)
-        if (commanded is None or commanded < 6 or station.get('state') != 3
-                or mono-self.limit_changed_at.get(station_id, mono) < 12):
+        if commanded is None or commanded < 6 or station.get('state') != 3:
+            self.demand_caps.pop(station_id, None)
+            self.underuse_since.pop(station_id, None)
+            station['adaptive_limit_a'] = maximum
+            return maximum
+        learned = self.demand_caps.get(station_id)
+        if learned:
+            cap, probe_at = learned
+            if mono >= probe_at or measured >= cap-0.5:
+                self.demand_caps.pop(station_id, None)
+                self.underuse_since.pop(station_id, None)
+            else:
+                maximum = min(maximum, cap)
+        # Keep an observed demand cap during ramp-up and in the dead band.
+        # Otherwise our own reduction immediately restores the hardware maximum.
+        if mono-self.limit_changed_at.get(station_id, mono) < 12:
             self.underuse_since.pop(station_id, None)
             station['adaptive_limit_a'] = maximum
             return maximum
@@ -347,6 +498,8 @@ class ActiveController(CommissioningController):
             since = self.underuse_since.setdefault(station_id, mono)
             if mono-since >= 10:
                 cap = min(maximum, max(6, math.ceil(measured+0.5)))
+                if cap < maximum:
+                    self.demand_caps[station_id] = (cap, mono+self.settings.rotation_seconds)
                 station['adaptive_limit_a'] = cap
                 return cap
         else:
@@ -363,7 +516,15 @@ class ActiveController(CommissioningController):
         which are already drawing power.
         """
         station_id = station['id']
-        if station.get('state') != 2 or not station.get('connected'):
+        # A pause is imposed by us, not evidence that the EV needs no power.
+        # Start a fresh grace period after resuming (also after an outage).
+        # State and current are separate Modbus reads: current can already be
+        # flowing while the earlier state sample still says "waiting".
+        # Keep the timer across not-ready, waiting and suspended states. Our
+        # own 0-A command can cause suspension without any new vehicle demand.
+        if (self.settings.paused or station.get('paused')
+                or not station.get('online', True) or not station.get('connected')
+                or station.get('state') not in (1, 2, 5) or max(station.get('currents_a') or [0]) >= 0.5):
             self.waiting_since.pop(station_id, None)
             station['waiting_reclaimed'] = False
             return None
@@ -407,6 +568,9 @@ class ActiveController(CommissioningController):
             station['commanded_current_a'] = limit
             station['control_error'] = error
             if error:
+                self.failsafe_ready.discard(station['id'])
+                self.applied_limits.pop(station['id'], None)
+                self.control_refreshed_at.pop(station['id'], None)
                 station['status'] = 'offline' if not station['online'] else 'safe'
                 station['connection_detail'] = ('Keine Regelverbindung: ' + error)[:180]
             elif station['connected']:
@@ -415,14 +579,14 @@ class ActiveController(CommissioningController):
                 adaptive = station.get('adaptive_limit_a', station['max_current_a'])
                 detail = f'Aktive Freigabe: {limit} A · Fallback-Gebäudelast'
                 if station.get('waiting_reclaimed'):
-                    detail = 'Fahrzeug fordert keine Leistung an · Budget umverteilt'
-                elif station.get('state') == 2:
-                    detail = f'Startsignal: {limit} A · wartet auf Ladeanforderung des Fahrzeugs'
+                    detail = 'Keine Leistungsabnahme · Budget umverteilt'
+                elif station.get('waiting_probe_a'):
+                    detail = f'Startsignal: {limit} A · wartet auf Ladebeginn'
                 elif adaptive < station['max_current_a']:
                     detail += f' · Fahrzeugbedarf auf {adaptive} A erkannt'
                 station['connection_detail'] = detail
                 station['failsafe_current_a'] = 0
-                station['failsafe_timeout_s'] = 10
+                station['failsafe_timeout_s'] = self.failsafe_timeout_s
 
         charging = round(sum(s['power_kw'] for s in stations), 3)
         estimated_charging = round(sum(limit * 690 / 1000 for limit in limits), 3)
@@ -449,6 +613,7 @@ class ActiveController(CommissioningController):
             'monta_status':'external_unverified', 'commissioned':True,
             'manual_start_ids':list(self.manual_start_until),
         }
+        self.publish_local_starts()
         if now-self.last_sample >= 5:
             await asyncio.to_thread(self.store.sample, now, building_kw, charging)
             self.last_sample = now
@@ -473,6 +638,11 @@ async def lifespan(app):
         task.cancel()
         try: await task
         except asyncio.CancelledError: pass
+        pending = list(getattr(app.state.controller, 'local_start_tasks', {}).values())
+        for operation in pending:
+            operation.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         store.db.close()
 
 

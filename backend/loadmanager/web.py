@@ -185,6 +185,10 @@ async def proxy(path: str, request: Request):
         body = await request.body()
         if len(body) > 16384:
             return JSONResponse({'detail': 'Anfrage zu groß.'}, status_code=413)
+        if path == 'commands':
+            payload = await auth_body(request)
+            if payload.get('kind') == 'local_access' and request.state.user['role'] != 'admin':
+                return JSONResponse({'detail': 'KEBA-Zugänge dürfen nur Administratoren hinterlegen.'}, status_code=403)
     else:
         body = b''
     try:

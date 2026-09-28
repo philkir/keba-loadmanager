@@ -41,7 +41,7 @@ class KebaModbus:
 
     async def telemetry(self, full=False):
         """Read operational data; full adds slower device and capability registers."""
-        # Keep all requests on this single connection: reads also feed the device watchdog.
+        # Keep telemetry requests on one connection. Failsafe needs explicit writes.
         state = await self.read32(1000)
         data = {'state':state,
                 'cable_state':await self.read32(1004),
@@ -87,9 +87,14 @@ class KebaModbus:
         if not 5<=timeout<=600:raise ValueError('Ungültiger Timeout')
         await self.set_limit(0)
         await self.write16(5016,0)
-        await self.write16(5018,timeout)
+        await self.refresh_failsafe(timeout)
         if self.model=='P30 x':await self.write16(5020,1)
         current,actual_timeout=await self.read32(1600),await self.read32(1602)
         if (current,actual_timeout)!=(0,timeout):raise IOError('Failsafe wurde nicht bestätigt')
+
+    async def refresh_failsafe(self, timeout=10):
+        """Feed the watchdog without stopping charging or persisting settings."""
+        if not 5<=timeout<=600:raise ValueError('Ungültiger Timeout')
+        await self.write16(5018,timeout)
 
     def close(self):self.client.close()

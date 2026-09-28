@@ -70,6 +70,11 @@ class Simulation(StrictModel):
     offline: list[str] = Field(default_factory=list, max_length=4)
 
 
+class LocalAccess(StrictModel):
+    username: str = Field(default='admin', min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+
+
 def default_stations():
     hosts = ['192.168.1.71', '192.168.1.72', '192.168.1.73', '192.168.1.74']
     return [StationSetting(id=f'cp-{i+1}', name=f'Ladepunkt {i+1:02}', model='P30 x' if i == 0 else 'P40', host=hosts[i]).model_dump() for i in range(4)]

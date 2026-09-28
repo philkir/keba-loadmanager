@@ -6,6 +6,7 @@ from pathlib import Path
 
 class Store:
     def __init__(self, path):
+        self.path = Path(path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
@@ -31,6 +32,13 @@ class Store:
     def previous(self, command_id):
         row = self.db.execute('SELECT result FROM commands WHERE id=?', (command_id,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def finish_command(self, command_id, result, message, level='info', key=None):
+        with self.db:
+            self.db.execute('UPDATE commands SET result=? WHERE id=?', (json.dumps(result), command_id))
+            if key:
+                self.db.execute('INSERT OR REPLACE INTO config VALUES (?,?)', (key, json.dumps(result)))
+            self.db.execute('INSERT INTO events(ts,level,message) VALUES (?,?,?)', (time.time(), level, message))
 
     def event(self, message, level='info'):
         with self.db:

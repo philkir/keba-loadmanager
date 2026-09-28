@@ -126,6 +126,20 @@ class AuthTests(unittest.TestCase):
                 self.assertEqual(self.post('/auth/setup', body).status_code, 422)
         self.assertTrue(self.store.setup_required())
 
+    def test_only_admin_can_save_wallbox_credentials_but_operator_can_start(self):
+        self.setup_account()
+        payload = {'kind':'local_access', 'station_id':'cp-1',
+                   'value':{'username':'admin', 'password':'synthetic-wallbox-secret'}}
+        self.assertEqual(self.post('/api/commands', payload).status_code, 200)
+        operator = {'username':'operator@example.com', 'password':'synthetic-Operator!234', 'role':'operator'}
+        self.assertEqual(self.post('/auth/users', operator).status_code, 201)
+        self.post('/auth/logout', {})
+        self.assertEqual(self.post('/auth/login', operator).status_code, 200)
+        self.upstream.reset_mock()
+        self.assertEqual(self.post('/api/commands', payload).status_code, 403)
+        self.upstream.assert_not_awaited()
+        self.assertEqual(self.post('/api/commands', {'kind':'local_start', 'station_id':'cp-1'}).status_code, 200)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

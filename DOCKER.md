@@ -14,6 +14,12 @@ Neue Konfigurationen starten mit `MODE=active`. Dabei schreibt der Regler die be
 
 Die mitgelieferte Installation ist für 32 A beziehungsweise 22 kW je Ladepunkt konfiguriert. Der tatsächlich freigegebene Strom ist stets das Minimum aus Installationslimit, von der Wallbox gemeldetem Hardwarelimit und dem verfügbaren Standortbudget. Nimmt ein ladendes Fahrzeug seine Freigabe stabil nicht vollständig ab, gibt der Regler den ungenutzten Anteil nach einer Anlauf- und Hysteresezeit für andere Fahrzeuge frei. Ein angestecktes, aber nicht ladendes Fahrzeug erhält zunächst 30 Sekunden lang das 6-A-Startsignal. Fordert es weiterhin keine Leistung an, wird dieses Budget vollständig umverteilt und alle `Warteplatzrotation` Sekunden für 12 Sekunden erneut angeboten.
 
+Die aus Register 1100 zurückgelesene Stromfreigabe wird nur angezeigt und begrenzt spätere Erhöhungen nicht. Maßgeblich ist die Hardwaregrenze aus Register 1110 einschließlich Kabel- und Temperaturbegrenzung. Die Rückgewinnung ungenutzten Budgets gilt auch für angesteckte Ladepunkte, die „nicht bereit“ oder „unterbrochen“ melden. Wechsel zwischen diesen Zuständen starten die Anlaufzeit nicht neu; eine tatsächlich beginnende Leistungsabnahme beendet die Rückgewinnung.
+
+Ein stabil erkannter Fahrzeugbedarf bleibt als adaptives Limit erhalten, bis das Fahrzeug die Freigabe nahezu ausschöpft oder nach `Warteplatzrotation` Sekunden ein neuer Bedarfsversuch erfolgt. Dadurch pendelt die Freigabe nicht zwischen Fahrzeugbedarf und Hardwaremaximum.
+
+Auch bei unveränderter Freigabe bestätigt der Regler den Failsafe-Timeout und die Ladefreigabe regelmäßig per Modbus-Schreibbefehl (im ersten Regelzyklus nach 6 Sekunden). Reine Leseabfragen reichen dafür nicht zuverlässig aus. Nach einer Kommunikationsunterbrechung wird die Freigabe erneut gesetzt; der Geräte-Failsafe bleibt auf 10 Sekunden und 0 A eingestellt. Beim Fortsetzen nach einer Pause beginnt die 30-sekündige Anlaufzeit neu.
+
 ## Lokal starten
 
 Im Projektverzeichnis:
@@ -140,3 +146,34 @@ docker compose --profile tunnel up -d
 ## Wichtiger Betriebsstand
 
 Der Modus `active` schreibt die berechneten Leistungsfreigaben über Modbus TCP. Ohne Gebäudemessung ist die Einhaltung der realen Anschlussgrenze nur so konservativ wie der eingestellte Fallback-Wert. Der Modus `commissioning` bleibt als vollständig schreibgeschützter Diagnosemodus erhalten. Monta und OCPP bleiben davon unabhängig.
+
+## Manuellen Ladestart einrichten
+
+Im aktiven Modus können Administratoren unter **Ladepunkte → Manueller Ladestart**
+den Benutzernamen und das Passwort der jeweiligen lokalen KEBA-Weboberfläche
+hinterlegen. Unter **Übersicht** erscheint dann **Manuell starten**, sobald ein
+Fahrzeug verbunden und die Pause aufgehoben ist. **Fortsetzen / Erneut anfordern**
+bleibt eine reine Leistungsanforderung für eine bereits autorisierte Sitzung.
+
+Der manuelle Start meldet sich per HTTPS auf Port 8443 direkt an der KEBA an,
+prüft die Seriennummer gegen die Modbus-Erkennung und verwendet ausschließlich
+den von der Firmware dokumentierten REST-Startendpunkt. Die KEBA verwendet
+lokal ein selbstsigniertes Zertifikat; der Client akzeptiert es ausschließlich
+für die konfigurierte private IP-Adresse. Es werden keine OCPP-, RFID- oder
+Autorisierungseinstellungen geändert und keine Monta-Startbefehle gesendet.
+Ob die installierte Wallboxkonfiguration eine zusätzliche OCPP-Autorisierung
+verlangt, muss bei der Inbetriebnahme mit einem echten Start geprüft werden.
+Eine angenommene REST-Anfrage allein bestätigt noch keinen Energiefluss.
+
+Die Anzeige unterscheidet laufende, angenommene, abgelehnte und unbestätigte
+Startanfragen. Bei verlorener Antwort oder Neustart wird nicht automatisch
+nochmals gestartet. Die Lastregelung und der Failsafe-Heartbeat laufen während
+der Anfrage weiter; eine Standort- oder Ladepunktpause bleibt wirksam.
+
+Zugangsdaten liegen nur in `wallbox-access.json` neben der SQLite-Datei im
+lokalen Datenvolume, mit Dateirechten `0600`. Sie werden weder über die API
+zurückgegeben noch im Ereignisprotokoll gespeichert. Diese Datei gehört zu
+vertraulichen Backups. Ein Wechsel der IP-Adresse oder des Modells erfordert
+neues Hinterlegen des Zugangs. Operatoren dürfen manuell starten; nur
+Administratoren dürfen Zugangsdaten speichern. Im Nur-Lese- und Simulationsmodus
+ist diese Hardwarefunktion gesperrt.
