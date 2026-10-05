@@ -11,7 +11,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import ValidationError
 
 from .allocator import allocate
-from .modbus import KebaModbus
+from .regulation import SmoothRegulation
+from .modbus import KebaModbus, DETAIL_REGISTERS
+from .shelly import ShellyPro3EM, building_phase_currents
 from .keba_rest import KebaRest, LocalStartError, LocalStartUncertain
 from .local_access import LocalAccessStore
 from .models import LocalAccess, Settings, Simulation, StationPatch, StationSetting, station_defaults_from_file
@@ -165,7 +167,122 @@ class CommissioningController:
         self.lock = asyncio.Lock()
         self.last_snapshot = None
         self.telemetry_cache = {}
-        self.last_full_read = {}
+        self.last_sample = 0
+        self.meter_identity = None
+        self.last_meter_timestamp = 0
+        self.meter_changed_at = 0
+        self.last_good_meter = None
+        self.last_good_site = None
+        self.last_good_site_at = float('-inf')
+        self.detail_cursor = {}
+
+    async def read_meter(self):
+        config = self.settings.meter
+        identity = (config.enabled, config.host, config.port, config.device_id)
+        if identity != self.meter_identity:
+            self.meter_identity = identity
+            self.last_meter_timestamp = 0
+            self.meter_changed_at = 0
+            self.last_good_meter = None
+            self.last_good_site = None
+        meter = {**(self.last_good_meter or {}), 'online':False, 'timestamp':self.last_meter_timestamp, 'error':None}
+        if not config.enabled:
+            return meter
+        device = ShellyPro3EM(config.host, port=config.port, device_id=config.device_id)
+        try:
+            async with asyncio.timeout(2):
+                for attempt in range(2):
+                    try:
+                        await device.connect()
+                        data = await device.telemetry()
+                        break
+                    except ValueError:
+                        raise
+                    except Exception:
+                        if attempt:
+                            raise
+                        device.close()
+            now, mono = time.time(), time.monotonic()
+            if not now-5 <= data['timestamp'] <= now+3:
+                raise ValueError('Shelly-Messwerte veraltet; Gerätezeit/NTP prüfen')
+            if data['timestamp'] != self.last_meter_timestamp:
+                self.meter_changed_at = mono
+            elif mono-self.meter_changed_at > 5:
+                raise ValueError('Shelly-Messwerte werden nicht aktualisiert')
+            self.last_meter_timestamp = data['timestamp']
+            self.last_good_meter = data.copy()
+            return {**data, 'online':True, 'error':None}
+        except Exception as exc:
+            meter['error'] = str(exc) or 'Zeitüberschreitung bei der Shelly-Abfrage'
+            # Only communication loss may bridge a short gap. Invalid data or
+            # device error flags must cause an immediate safe stop.
+            meter['transient'] = not isinstance(exc, ValueError)
+            return meter
+        finally:
+            device.close()
+
+    async def read_site(self):
+        stations = await asyncio.gather(*(self.probe(s) for s in self.station_config))
+        # Read the main meter last: optional KEBA diagnostics used to age it
+        # past the freshness deadline before it could even be used.
+        meter = await self.read_meter()
+        if meter['online'] and time.time()-meter['timestamp'] > 5:
+            meter = {'online':False, 'timestamp':meter['timestamp'], 'error':'Shelly-Messwerte veraltet'}
+        charging = sum(s['power_kw'] for s in stations)
+        source, error = 'fallback', None
+        building_kw = self.settings.fallback_building_kw
+        building_a = [building_kw*1000/690]*3
+        if self.settings.meter.enabled:
+            valid_stations = all(s['online'] and len(s['currents_a']) == 3
+                                 and all(math.isfinite(v) and v >= 0 for v in [s['power_kw'], *s['currents_a']])
+                                 for s in stations)
+            if not meter['online'] or not valid_stations:
+                source = 'unavailable'
+                error = meter['error'] or 'Ladepunktmessung unvollständig; Gebäudelast nicht bestimmbar'
+                building_kw, building_a = 0, [0, 0, 0]
+            else:
+                source = 'meter'
+                building_kw = meter['power_kw']-charging
+                building_a = building_phase_currents(meter, stations)
+        phases = meter['currents_a'] if meter['online'] else [
+            building_a[p]+sum(s['currents_a'][p] for s in stations) for p in range(3)]
+        total = meter['power_kw'] if meter['online'] else building_kw+charging
+        site = {
+            'meter':meter, 'meter_online':meter['online'], 'meter_timestamp':meter['timestamp'],
+            'building_source':source, 'measurement_error':error,
+            'building_kw':round(building_kw, 3), 'charging_kw':round(charging, 3),
+            'total_kw':round(total, 3), 'phase_currents_a':[round(i, 3) for i in phases],
+            'building_currents_a':building_a,
+            'control_base_a':[max(0, meter['currents_a'][p]-sum(s['currents_a'][p] for s in stations))
+                              for p in range(3)] if source == 'meter' else building_a,
+            'headroom_kw':round(max(0, self.settings.power_limit_kw-self.settings.reserve_kw-max(0, building_kw)-charging), 3) if source != 'unavailable' else 0,
+            'power_ceiling_kw':self.settings.power_limit_kw*(1+self.settings.power_tolerance_pct/100),
+            'overload':total > self.settings.power_limit_kw*(1+self.settings.power_tolerance_pct/100) or any(i > self.settings.phase_limit_a for i in phases),
+        }
+        if source == 'meter':
+            self.last_good_site = site.copy()
+            self.last_good_site_at = time.monotonic()
+        elif (source == 'unavailable' and self.last_good_site is not None
+              and time.monotonic()-self.last_good_site_at <= 5
+              and time.time()-self.last_good_site['meter_timestamp'] <= 5
+              and not self.last_good_site['overload']
+              and (meter['online'] or meter.get('transient'))):
+            # No new capacity is calculated from mixed old/new samples.
+            grid = {k:site[k] for k in ('total_kw', 'phase_currents_a', 'meter_timestamp')} if meter['online'] else {}
+            site = {**self.last_good_site, **grid, 'meter':meter, 'meter_online':meter['online'],
+                    'building_source':'hold', 'measurement_error':error, 'headroom_kw':0,
+                    'overload':site['overload'] if meter['online'] else self.last_good_site['overload']}
+            # A fresh grid overload overrides gap tolerance immediately.
+            if site['overload']:
+                site['building_source'] = 'unavailable'
+            building_a = site['building_currents_a']
+        return stations, building_a, site
+
+    async def sample_site(self, now, site):
+        if now-self.last_sample >= 5:
+            if site['building_source'] in ('meter', 'fallback'):
+                await asyncio.to_thread(self.store.sample, now, site['building_kw'], site['charging_kw'])
+            self.last_sample = now
 
     async def probe(self, setting):
         station = {**setting, 'connected':False, 'online':False, 'network_online':False,
@@ -175,26 +292,20 @@ class CommissioningController:
         if not setting['host']:
             return station
         station['web_url'] = f"https://{setting['host']}:8443" if setting['model'] == 'P30 x' else f"https://{setting['host']}"
-        station['network_online'] = await port_open(setting['host'], 443) or await port_open(setting['host'], 80)
-        modbus_online = await port_open(setting['host'], setting['port'])
-        station['network_online'] = station['network_online'] or modbus_online
-        if not modbus_online:
-            station['status'] = 'setup' if station['network_online'] else 'offline'
-            station['connection_detail'] = ('Gerät erreichbar, Modbus TCP ist nicht aktiv'
-                                            if station['network_online'] else 'Gerät im Netz nicht erreichbar')
-            return station
         wallbox = KebaModbus(setting['host'], setting['model'], port=setting['port'],
                             device_id=setting['device_id'], writes_enabled=False,
                             max_current_a=setting['max_current_a'])
         try:
-            await wallbox.connect()
-            full = time.monotonic()-self.last_full_read.get(setting['id'], 0) >= 60
-            data = await wallbox.telemetry(full=full)
-            if full:
-                self.telemetry_cache[setting['id']] = data.copy()
-                self.last_full_read[setting['id']] = time.monotonic()
-            else:
-                data = {**self.telemetry_cache.get(setting['id'], {}), **data}
+            identity = (setting['host'], setting['port'], setting['device_id'], setting['model'])
+            key = (setting['id'], identity)
+            registers = DETAIL_REGISTERS + ([1200,1700,1702] if setting['model'] == 'P40' else [])
+            cursor = self.detail_cursor.get(key, 0)
+            self.detail_cursor[key] = (cursor+3) % len(registers)
+            async with asyncio.timeout(3):
+                await wallbox.connect()
+                data = await wallbox.telemetry(detail_registers=registers[cursor:cursor+3])
+            data = {**self.telemetry_cache.get(key, {}), **data}
+            self.telemetry_cache[key] = data.copy()
             station.update(data)
             station['installation_limit_a'] = setting['max_current_a']
             # Register 1100 includes our own previous grant; using it as a
@@ -205,46 +316,48 @@ class CommissioningController:
             if hardware_limit is not None:
                 station['max_current_a'] = min(setting['max_current_a'], max(0, math.floor(hardware_limit)))
             station['online'] = True
+            station['network_online'] = True
             station['connected'] = data['cable_state'] in (5, 7)
             station['current_a'] = round(max(data['currents_a']), 3)
             station['status'] = ('charging' if data['state'] == 3 else 'safe' if data['state'] == 4
                                  else 'paused' if data['state'] == 5 else 'waiting' if data['state'] == 2
                                  else 'available')
             station['connection_detail'] = 'Modbus TCP verbunden (nur Lesen)'
-        except Exception:
+        except Exception as exc:
             station['status'] = 'setup'
-            station['connection_detail'] = 'Modbus TCP antwortet, Register konnten nicht gelesen werden'
+            station['connection_detail'] = 'Modbus-Abfrage fehlgeschlagen: ' + (str(exc) or 'Zeitüberschreitung')[:100]
         finally:
             wallbox.close()
         return station
 
     async def tick(self):
         now = time.time()
-        stations = await asyncio.gather(*(self.probe(s) for s in self.station_config))
-        charging = round(sum(s['power_kw'] for s in stations), 3)
-        phases = [round(sum(s['currents_a'][phase] for s in stations), 3) for phase in range(3)]
-        snapshot = tuple((s['id'], s['status'], s.get('serial')) for s in stations)
+        stations, _, site = await self.read_site()
+        snapshot = (tuple((s['id'], s['status'], s.get('serial')) for s in stations), site['meter_online'], site['measurement_error'])
         if snapshot != self.last_snapshot:
             online = sum(s['online'] for s in stations)
             web = sum(s['network_online'] for s in stations)
             await asyncio.to_thread(self.store.event,
-                f'Inbetriebnahme: {web} Geräte im Netz, {online} über Modbus lesbar.',
+                f'Inbetriebnahme: {web} Geräte im Netz, {online} über Modbus lesbar. '
+                + ('Shelly-Hauptanschlussmessung verbunden.' if site['meter_online'] else site['measurement_error'] or 'Kein Hauptanschlusszähler aktiviert.'),
                 'info' if online == len(stations) else 'warning')
             self.last_snapshot = snapshot
         self.state = {
-            'mode':'commissioning', 'status':'commissioning', 'timestamp':now, 'meter_timestamp':0,
+            'mode':'commissioning', 'status':'commissioning', 'timestamp':time.time(),
             'site_name':self.settings.site_name, 'settings':self.settings.model_dump(), 'stations':stations,
-            'simulation':self.sim.model_dump(), 'building_kw':0, 'charging_kw':charging,
-            'total_kw':charging, 'phase_currents_a':phases, 'headroom_kw':0, 'meter_online':False,
-            'revision':self.revision, 'overload':False, 'monta_status':'external_unverified',
+            'simulation':self.sim.model_dump(), **site,
+            'revision':self.revision, 'monta_status':'external_unverified',
             'commissioned':False,
         }
+        if site['building_source'] == 'meter':
+            await self.sample_site(now, site)
 
     async def run(self):
         while True:
+            started = time.monotonic()
             async with self.lock:
                 await self.tick()
-            await asyncio.sleep(2)
+            await asyncio.sleep(max(0.1, 2-(time.monotonic()-started)))
 
     async def command(self, body):
         try:
@@ -297,7 +410,7 @@ class CommissioningController:
 
 
 class ActiveController(CommissioningController):
-    """Live controller using a conservative configured load when no site meter exists."""
+    """Live controller with site metering or an explicitly configured fallback."""
     waiting_grace_s = 30
     waiting_probe_s = 12
     failsafe_timeout_s = 10
@@ -313,6 +426,7 @@ class ActiveController(CommissioningController):
         self.underuse_since = {}
         self.demand_caps = {}
         self.waiting_since = {}
+        self.regulation = SmoothRegulation()
         self.last_condition = None
         self.last_sample = 0
 
@@ -457,9 +571,10 @@ class ActiveController(CommissioningController):
                 self.limit_changed_at[station_id] = self.control_refreshed_at[station_id]
             return None
         except Exception as exc:
-            self.failsafe_ready.discard(station_id)
-            self.applied_limits.pop(station_id, None)
-            self.control_refreshed_at.pop(station_id, None)
+            if time.monotonic()-self.control_refreshed_at.get(station_id, float('-inf')) >= self.failsafe_timeout_s:
+                self.failsafe_ready.discard(station_id)
+                self.applied_limits.pop(station_id, None)
+                self.control_refreshed_at.pop(station_id, None)
             return str(exc)
         finally:
             wallbox.close()
@@ -508,45 +623,30 @@ class ActiveController(CommissioningController):
         return maximum
 
     def waiting_cap(self, station, mono):
-        """Briefly offer 6 A, then reclaim capacity from a non-requesting EV.
+        """Keep a continuous minimum offer while capacity permits.
 
-        IEC 61851 needs at least 6 A to signal that charging is available. A
-        permanent offer would reserve capacity for a sleeping or full vehicle,
-        so short periodic probes let it wake again without starving sessions
-        which are already drawing power.
+        Repeated 0/6-A wake-up probes can look like charging faults to cars.
+        A waiting EV only loses its offer when the real site budget needs it.
         """
         station_id = station['id']
-        # A pause is imposed by us, not evidence that the EV needs no power.
-        # Start a fresh grace period after resuming (also after an outage).
-        # State and current are separate Modbus reads: current can already be
-        # flowing while the earlier state sample still says "waiting".
-        # Keep the timer across not-ready, waiting and suspended states. Our
-        # own 0-A command can cause suspension without any new vehicle demand.
+        station['waiting_reclaimed'] = False
         if (self.settings.paused or station.get('paused')
                 or not station.get('online', True) or not station.get('connected')
                 or station.get('state') not in (1, 2, 5) or max(station.get('currents_a') or [0]) >= 0.5):
             self.waiting_since.pop(station_id, None)
-            station['waiting_reclaimed'] = False
             return None
-        since = self.waiting_since.setdefault(station_id, mono)
-        elapsed = max(0, mono-since)
-        if elapsed < self.waiting_grace_s:
-            cap = 6
-        else:
-            # A manual start is a bounded wake-up attempt, not a long-lived
-            # reservation for a vehicle that never starts drawing current.
-            self.manual_start_until.pop(station_id, None)
-            cycle = (elapsed-self.waiting_grace_s) % self.settings.rotation_seconds
-            cap = 6 if cycle >= self.settings.rotation_seconds-self.waiting_probe_s else 0
-        station['waiting_reclaimed'] = cap == 0
-        station['waiting_probe_a'] = cap
-        return cap
+        self.waiting_since.setdefault(station_id, mono)
+        station['waiting_probe_a'] = 6
+        return 6
 
     async def tick(self):
         now, mono = time.time(), time.monotonic()
-        stations = await asyncio.gather(*(self.probe(s) for s in self.station_config))
-        building_kw = self.settings.fallback_building_kw
-        building_a = [building_kw * 1000 / 690] * 3
+        stations, building_a, site = await self.read_site()
+        measurement_fault = site['building_source'] == 'unavailable'
+        if site['building_source'] in ('meter', 'hold'):
+            # Feedback coordinate for prospective grants, not a decomposition
+            # of RMS building current. Actual grid headroom gates every increase.
+            building_a = site['control_base_a']
         self.manual_start_until = {station_id:until for station_id,until in self.manual_start_until.items() if until > mono}
         allocation_stations = []
         for station in stations:
@@ -555,68 +655,84 @@ class ActiveController(CommissioningController):
             if waiting_cap is not None:
                 cap = min(cap, waiting_cap)
             allocation_stations.append({**station, 'max_current_a':cap,
-                                        'allocation_rank':2 if station.get('state') == 3 else 1,
+                                        'allocation_rank':2 if station.get('state') == 3 or max(station['currents_a']) >= 0.5 else 1,
                                         'priority':'high' if station['id'] in self.manual_start_until else station['priority']})
         allocation_stations.sort(key=lambda station:self.manual_start_until.get(station['id'], 0), reverse=True)
-        grants = allocate(allocation_stations, building_a, building_kw, self.settings,
-                          0 if self.manual_start_until else mono)
+        grants = allocate(allocation_stations, building_a, max(0, site['building_kw']), self.settings,
+                          0 if self.manual_start_until else mono,
+                          voltages_v=site['meter'].get('voltages_v'), previous=self.applied_limits)
+        grants = self.regulation.apply(
+            stations, grants, self.applied_limits, building_a, max(0, site['building_kw']),
+            self.settings, mono, site['meter'].get('voltages_v'),
+            meter=site['meter'] if site['building_source'] == 'meter' else None,
+            hold=site['building_source'] == 'hold', fault=measurement_fault)
+        if measurement_fault:
+            grants = dict.fromkeys(grants, 0)
+
         limits = [0 if self.settings.paused or s['paused'] or not s['connected'] else grants[s['id']]
                   for s in stations]
+        previous_limits = self.applied_limits.copy()
         results = await asyncio.gather(*(self.apply_limit(s, limit) if s['online'] else asyncio.sleep(0, result='nicht erreichbar')
                                          for s, limit in zip(stations, limits)))
         for station, limit, error in zip(stations, limits, results):
             station['commanded_current_a'] = limit
             station['control_error'] = error
+            previous = previous_limits.get(station['id'])
+            if not error and previous is not None and (previous == 0) != (limit == 0) and station['connected']:
+                await asyncio.to_thread(self.store.event,
+                    f"{station['name']}: Freigabe {previous} → {limit} A · {station.get('control_reason', '')}",
+                    'warning' if limit == 0 and measurement_fault else 'info')
             if error:
-                self.failsafe_ready.discard(station['id'])
-                self.applied_limits.pop(station['id'], None)
-                self.control_refreshed_at.pop(station['id'], None)
+                if time.monotonic()-self.control_refreshed_at.get(station['id'], float('-inf')) >= self.failsafe_timeout_s:
+                    self.failsafe_ready.discard(station['id'])
+                    self.applied_limits.pop(station['id'], None)
+                    self.control_refreshed_at.pop(station['id'], None)
                 station['status'] = 'offline' if not station['online'] else 'safe'
                 station['connection_detail'] = ('Keine Regelverbindung: ' + error)[:180]
             elif station['connected']:
-                station['status'] = ('paused' if self.settings.paused or station['paused'] else
+                station['status'] = ('safe' if measurement_fault else 'paused' if self.settings.paused or station['paused'] else
                                      'charging' if station['state'] == 3 and limit else 'waiting')
                 adaptive = station.get('adaptive_limit_a', station['max_current_a'])
-                detail = f'Aktive Freigabe: {limit} A · Fallback-Gebäudelast'
+                detail = f"Aktive Freigabe: {limit} A · {'Shelly-Hauptanschlussmessung' if site['meter_online'] else 'Fallback-Gebäudelast'}"
                 if station.get('waiting_reclaimed'):
                     detail = 'Keine Leistungsabnahme · Budget umverteilt'
                 elif station.get('waiting_probe_a'):
                     detail = f'Startsignal: {limit} A · wartet auf Ladebeginn'
                 elif adaptive < station['max_current_a']:
                     detail += f' · Fahrzeugbedarf auf {adaptive} A erkannt'
+                detail += ' · ' + station.get('control_reason', '')
+                if measurement_fault:
+                    detail = 'Sicherer Halt: ' + site['measurement_error']
                 station['connection_detail'] = detail
                 station['failsafe_current_a'] = 0
                 station['failsafe_timeout_s'] = self.failsafe_timeout_s
 
-        charging = round(sum(s['power_kw'] for s in stations), 3)
-        estimated_charging = round(sum(limit * 690 / 1000 for limit in limits), 3)
-        total = round(building_kw + charging, 3)
-        phases = [round(building_a[p] + sum(s['currents_a'][p] for s in stations), 3) for p in range(3)]
+        voltage_sum = sum(max(230, v) for v in site['meter'].get('voltages_v', [230]*3))
+        estimated_charging = round(sum(limits)*voltage_sum/1000, 3)
         errors = sum(bool(error) for error in results)
-        condition = 'paused' if self.settings.paused else 'degraded' if errors else 'active'
-        if condition != self.last_condition:
+        condition = 'safe' if measurement_fault else 'paused' if self.settings.paused else 'holding' if site['building_source'] == 'hold' else 'degraded' if errors else 'active'
+        condition_key = (condition, site['building_source'], site['measurement_error'])
+        if condition_key != self.last_condition:
             messages = {
-                'active': 'Aktive lokale Regelung mit Fallback-Gebäudelast.',
+                'active': 'Aktive lokale Regelung mit ' + ('Shelly-Hauptanschlussmessung.' if site['meter_online'] else 'Fallback-Gebäudelast.'),
+                'safe': 'Sicherer Halt: ' + (site['measurement_error'] or ''),
+                'holding': 'Kurze Messlücke: bestehende Freigaben werden höchstens bis zum Messalter von 5 Sekunden gehalten.',
                 'paused': 'Alle Ladepunkte wurden aktiv auf 0 A gesetzt.',
                 'degraded': f'Regelung eingeschränkt: {errors} Ladepunkt(e) nicht steuerbar.',
             }
-            await asyncio.to_thread(self.store.event, messages[condition], 'warning' if errors else 'info')
-            self.last_condition = condition
+            await asyncio.to_thread(self.store.event, messages[condition], 'warning' if errors or measurement_fault else 'info')
+            self.last_condition = condition_key
         self.state = {
-            'mode':'active', 'status':condition, 'timestamp':now, 'meter_timestamp':0,
+            'mode':'active', 'status':condition, 'timestamp':time.time(),
+            'cycle_duration_s':round(time.monotonic()-mono, 3),
             'site_name':self.settings.site_name, 'settings':self.settings.model_dump(), 'stations':stations,
-            'simulation':self.sim.model_dump(), 'building_kw':building_kw, 'charging_kw':charging,
-            'estimated_charging_kw':estimated_charging, 'total_kw':total, 'phase_currents_a':phases,
-            'headroom_kw':round(max(0, self.settings.power_limit_kw-self.settings.reserve_kw-building_kw-charging), 3),
-            'meter_online':False, 'building_source':'fallback', 'revision':self.revision,
-            'overload':total > self.settings.power_limit_kw or any(x > self.settings.phase_limit_a for x in phases),
+            'simulation':self.sim.model_dump(), **site,
+            'estimated_charging_kw':estimated_charging, 'revision':self.revision,
             'monta_status':'external_unverified', 'commissioned':True,
             'manual_start_ids':list(self.manual_start_until),
         }
         self.publish_local_starts()
-        if now-self.last_sample >= 5:
-            await asyncio.to_thread(self.store.sample, now, building_kw, charging)
-            self.last_sample = now
+        await self.sample_site(now, site)
 
 
 @asynccontextmanager

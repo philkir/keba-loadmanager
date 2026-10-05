@@ -25,13 +25,13 @@ def live_controller(tmp_path, monkeypatch):
         async def connect(self):
             pass
 
-        async def telemetry(self, full=False):
+        async def telemetry(self, full=False, detail_registers=None):
             d = self.device
             current = min(d['limit'], d.get('demand', d['limit'])) if d['drawing'] else 0
             data = {'state':3 if d['drawing'] else 5 if d['limit'] == 0 else 1,
                     'cable_state':7, 'error_code':0, 'currents_a':[current]*3,
                     'power_kw':current*0.69, 'energy_kwh':0, 'session_kwh':0}
-            if full:
+            if full or detail_registers is not None:
                 data.update(device_limit_a=d['limit'], hardware_limit_a=d['hardware'])
             return data
 
@@ -78,52 +78,44 @@ def test_allocation_ceiling_uses_hardware_and_installation(live_controller, read
     assert station['max_current_a'] == expected
 
 
-def test_stopped_vehicle_releases_budget_across_suspended_state_and_cached_reads(live_controller):
+def test_waiting_vehicle_does_not_cycle_off_and_on(live_controller):
     active, clock, devices = live_controller
 
-    async def tick_at(second):
-        clock.now = second
-        await active.tick()
-        grants = active.applied_limits
-        settings = active.settings
-        assert sum(grants.values())*0.69 <= settings.power_limit_kw-settings.reserve_kw-settings.fallback_building_kw
-        assert sum(grants.values())+(settings.fallback_building_kw+settings.reserve_kw)*1000/690 <= settings.phase_limit_a
-        assert 0 <= grants['cp-1'] <= 20
-        assert 0 <= grants['cp-2'] <= 16
-        return dict(grants)
-
     async def scenario():
-        # Before this fix both points were stuck at their echoed 12 A limit.
-        assert await tick_at(100) == {'cp-1':18, 'cp-2':6}
-        assert await tick_at(129) == {'cp-1':18, 'cp-2':6}
-        assert await tick_at(131) == {'cp-1':20, 'cp-2':0}
-        # Our 0-A command changes the P40 to suspended. It must stay reclaimed,
-        # even after the next full read reports 0 A as its current device limit.
-        assert await tick_at(134) == {'cp-1':20, 'cp-2':0}
-        assert await tick_at(162) == {'cp-1':20, 'cp-2':0}
-        # Periodic wake-up offers remain possible within all site limits.
-        assert await tick_at(359) == {'cp-1':18, 'cp-2':6}
-        assert await tick_at(371) == {'cp-1':20, 'cp-2':0}
-        # Once the second vehicle draws current again, both share the budget.
-        assert await tick_at(599) == {'cp-1':18, 'cp-2':6}
+        previous = {'cp-1':0, 'cp-2':0}
+        for second in range(100, 601, 2):
+            clock.now = second
+            await active.tick()
+            grants = active.applied_limits
+            assert grants['cp-2'] == 6
+            assert grants['cp-1'] >= 6
+            assert grants['cp-1']-previous['cp-1'] <= (6 if second == 100 else 1)
+            assert sum(grants.values())*0.69+6 <= active.settings.power_limit_kw
+            assert sum(grants.values())+6/0.69 <= active.settings.phase_limit_a
+            previous = grants.copy()
+        assert grants['cp-1'] > 12  # Device readback never becomes a capability cap.
         devices['192.168.1.72']['drawing'] = True
-        assert await tick_at(601) == {'cp-1':12, 'cp-2':12}
+        for second in range(601, 802, 2):
+            clock.now = second
+            await active.tick()
+            assert all(a >= 6 for a in active.applied_limits.values())
+        assert abs(active.applied_limits['cp-1']-active.applied_limits['cp-2']) <= 1
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize('state', [1, 2, 5])
-def test_waiting_states_share_one_grace_period(live_controller, state):
+def test_waiting_states_keep_offer_across_transitions(live_controller, state):
     active, _clock, _devices = live_controller
     station = {'id':'cp-2', 'connected':True, 'online':True, 'state':state,
                'currents_a':[0.004]*3}
     assert active.waiting_cap(station, 100) == 6
     # State transitions during stopping/authorization must not restart grace.
     station['state'] = 2 if state == 5 else 5
-    assert active.waiting_cap(station, 131) == 0
-    assert station['waiting_reclaimed'] is True
+    assert active.waiting_cap(station, 131) == 6
+    assert station['waiting_reclaimed'] is False
     station['state'] = 1
-    assert active.waiting_cap(station, 150) == 0
+    assert active.waiting_cap(station, 150) == 6
 
 
 @pytest.mark.parametrize('state', [1, 2, 5])
@@ -141,11 +133,11 @@ def test_learned_vehicle_demand_does_not_oscillate_with_hardware_limit(live_cont
     devices['192.168.1.71']['demand'] = 15.4
 
     async def scenario():
-        for second in range(100, 222, 2):
+        for second in range(100, 501, 2):
             clock.now = second
             await active.tick()
-            if second >= 130:
-                assert active.applied_limits == {'cp-1':16, 'cp-2':0}
+            if second >= 300:
+                assert active.applied_limits == {'cp-1':16, 'cp-2':6}
                 assert active.state['stations'][0]['current_a'] == 15.4
 
     asyncio.run(scenario())

@@ -2,8 +2,9 @@
 import math
 
 
-def allocate(stations, building_a, building_kw, settings, now):
+def allocate(stations, building_a, building_kw, settings, now, *, voltages_v=None, previous=None):
     grants = {s['id']: 0 for s in stations}
+    voltages = [max(230, v) for v in voltages_v] if voltages_v is not None else [230]*3
     if settings.paused or not all(math.isfinite(v) and v >= 0 for v in [*building_a, building_kw]):
         return grants
     # Reserve is kept both against active power and symmetrically on all phases.
@@ -21,19 +22,22 @@ def allocate(stations, building_a, building_kw, settings, now):
         for rank in sorted({s.get('allocation_rank', 1) for s in priority_group}, reverse=True):
             group = [s for s in priority_group if s.get('allocation_rank', 1) == rank]
             if group:
-                shift = slot % len(group)
+                # Never rotate charging sessions out of their minimum grant.
+                shift = 0 if previous is not None and rank >= 2 else slot % len(group)
                 order += group[shift:] + group[:shift]
+    if previous is not None:
+        order.sort(key=lambda s: previous.get(s['id'], 0) < 6)
 
     def fits(s, delta):
         return (all(phase_budget[p] + 1e-8 >= delta for p in s['phases'])
-                and power_budget + 1e-8 >= delta * 230 * len(s['phases']))
+                and power_budget + 1e-8 >= delta * sum(voltages[p] for p in s['phases']))
 
     def assign(s, delta):
         nonlocal power_budget
         grants[s['id']] += delta
         for p in s['phases']:
             phase_budget[p] -= delta
-        power_budget -= delta * 230 * len(s['phases'])
+        power_budget -= delta * sum(voltages[p] for p in s['phases'])
 
     # Admit at 6 A first, then distribute remaining amps evenly.
     for s in order:
@@ -41,7 +45,11 @@ def allocate(stations, building_a, building_kw, settings, now):
             assign(s, 6)
     while True:
         changed = False
-        for s in order:
+        # Keep a leftover amp at its current station instead of moving it on
+        # each rotation boundary. Equal grants still share larger budgets.
+        distribution = sorted(order, key=lambda s: grants[s['id']]) if previous is None else sorted(
+            order, key=lambda s: (grants[s['id']], grants[s['id']] >= previous.get(s['id'], 0)))
+        for s in distribution:
             if 0 < grants[s['id']] < s['max_current_a'] and fits(s, 1):
                 assign(s, 1)
                 changed = True

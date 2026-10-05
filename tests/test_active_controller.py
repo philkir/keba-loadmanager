@@ -24,7 +24,7 @@ class FakeKeba:
     async def connect(self):
         return None
 
-    async def telemetry(self, full=False):
+    async def telemetry(self, full=False, detail_registers=None):
         return {
             'state': 2, 'cable_state': 5, 'error_code': 0,
             'currents_a': [0, 0, 0], 'serial': 1, 'firmware_raw': 1,
@@ -97,21 +97,21 @@ def test_adaptive_cap_reclaims_only_stable_unused_current(tmp_path):
     store.db.close()
 
 
-def test_waiting_vehicle_releases_budget_and_is_probed_again(tmp_path):
+def test_waiting_vehicle_keeps_continuous_start_offer(tmp_path):
     store = Store(tmp_path / 'waiting.sqlite')
     active = controller.ActiveController(store)
     waiting = {'id':'cp-1', 'state':2, 'connected':True}
 
     assert active.waiting_cap(waiting, 100) == 6
-    assert active.waiting_cap(waiting, 131) == 0
-    assert waiting['waiting_reclaimed'] is True
+    assert active.waiting_cap(waiting, 131) == 6
+    assert waiting['waiting_reclaimed'] is False
     assert active.waiting_cap(
         waiting, 100+active.waiting_grace_s+active.settings.rotation_seconds-5
     ) == 6
     store.db.close()
 
 
-def test_active_vehicle_gets_reclaimed_capacity(tmp_path):
+def test_waiting_offer_and_active_vehicle_share_available_capacity(tmp_path):
     store = Store(tmp_path / 'demand.sqlite')
     active = controller.ActiveController(store)
     active.waiting_since = {'cp-1':100}
@@ -128,7 +128,7 @@ def test_active_vehicle_gets_reclaimed_capacity(tmp_path):
     grants = allocate([waiting, charging], building_a, settings.fallback_building_kw,
                       settings, 131)
 
-    assert grants == {'cp-1':0, 'cp-2':16}
+    assert grants == {'cp-1':6, 'cp-2':15}
     store.db.close()
 
 
@@ -209,7 +209,7 @@ def test_waiting_state_does_not_reclaim_when_current_already_flows(tmp_path):
         starting['currents_a'] = [0, 0, 0]
         assert active.waiting_cap(starting, 133) == 6
         assert active.waiting_cap(starting, 162) == 6
-        assert active.waiting_cap(starting, 164) == 0
+        assert active.waiting_cap(starting, 164) == 6
     finally:
         store.db.close()
 

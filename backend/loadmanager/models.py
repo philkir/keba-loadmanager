@@ -2,21 +2,48 @@ import json
 from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
 
 
+class MeterSettings(StrictModel):
+    enabled: bool = False
+    host: str = '192.168.1.217'
+    port: int = Field(default=502, ge=1, le=65535)
+    device_id: int = Field(default=1, ge=1, le=255)
+
+    @field_validator('host')
+    @classmethod
+    def private_ipv4(cls, value):
+        if not value:
+            return value
+        address = IPv4Address(value)
+        if not address.is_private:
+            raise ValueError('Nur private IPv4-Adressen sind erlaubt.')
+        return str(address)
+
+    @model_validator(mode='after')
+    def enabled_requires_host(self):
+        if self.enabled and not self.host:
+            raise ValueError('Für die Hauptanschlussmessung ist eine IP-Adresse erforderlich.')
+        return self
+
+
 class Settings(StrictModel):
     site_name: str = Field(default='Unser Ladepark', min_length=1, max_length=60)
     power_limit_kw: float = Field(default=25, ge=5, le=25)
-    phase_limit_a: float = Field(default=35, ge=6, le=35)
+    phase_limit_a: float = Field(default=35, ge=6, le=120)
+    power_tolerance_pct: float = Field(default=0, ge=0, le=10)
     reserve_kw: float = Field(default=1, ge=0.5, le=5)
     fallback_building_kw: float = Field(default=8, ge=0, le=20)
     rotation_seconds: int = Field(default=120, ge=30, le=900)
+    ramp_up_seconds: int = Field(default=10, ge=5, le=60)
+    restart_delay_seconds: int = Field(default=30, ge=10, le=300)
     paused: bool = False
+    meter: MeterSettings = Field(default_factory=MeterSettings)
 
 
 class StationSetting(StrictModel):

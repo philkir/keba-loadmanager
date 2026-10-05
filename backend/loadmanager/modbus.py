@@ -3,8 +3,10 @@
 Register maps: KEBA P30 V1.07, P40 V1.02. Verify against installed firmware.
 No RFID authorization or OCPP settings are written by this adapter.
 """
+import asyncio
 from pymodbus.client import AsyncModbusTcpClient
 
+DETAIL_REGISTERS = [1014,1016,1018,1040,1042,1044,1036,1502,1046,1100,1500,1550,1552,1600,1602]
 
 class KebaModbus:
     def __init__(self, host, model, *, port=502, device_id=255, writes_enabled=False, max_current_a=16):
@@ -39,7 +41,7 @@ class KebaModbus:
         except Exception:
             return None
 
-    async def telemetry(self, full=False):
+    async def telemetry(self, full=False, detail_registers=None):
         """Read operational data; full adds slower device and capability registers."""
         # Keep telemetry requests on one connection. Failsafe needs explicit writes.
         state = await self.read32(1000)
@@ -48,28 +50,33 @@ class KebaModbus:
                 'error_code':await self.read32(1006),
                 'currents_a':[await self.read32(r)/1000 for r in [1008,1010,1012]],
                 'power_kw':await self.read32(1020)/1_000_000,
-                'energy_kwh':await self.read32(1036)/10_000,
-                'session_kwh':(await self.read32(1502))/10_000}
-        if not full:
+                'hardware_limit_a':await self.read32(1110)/1000}
+        if not full and detail_registers is None:
             return data
-        raw = {register: await self.optional32(register) for register in
-               [1014,1016,1018,1040,1042,1044,1046,1100,1110,1500,1550,1552,1600,1602]}
-        if self.model == 'P40':
-            raw.update({register: await self.optional32(register) for register in [1200,1700,1702]})
-        data.update({
-            'serial':raw[1014], 'product_raw':raw[1016], 'firmware_raw':raw[1018],
-            'firmware':self.firmware_version(raw[1018]) if raw[1018] is not None else None,
-            'voltages_v':[raw[r] for r in [1040,1042,1044]],
-            'power_factor_pct':raw[1046]/10 if raw[1046] is not None else None,
-            'device_limit_a':raw[1100]/1000 if raw[1100] is not None else None,
-            'hardware_limit_a':raw[1110]/1000 if raw[1110] is not None else None,
-            'phase_switch_source':raw[1550], 'phase_count':raw[1552],
-            'rfid_uid':f'{raw[1500]:08X}' if raw[1500] is not None else None,
-            'failsafe_current_a':raw[1600]/1000 if raw[1600] is not None else None,
-            'failsafe_timeout_s':raw[1602],
-            'fast_charging':bool(raw.get(1200)) if raw.get(1200) is not None else None,
-            'hardware_revision':raw.get(1700), 'meter_hardware_revision':raw.get(1702),
-        })
+        registers = detail_registers if detail_registers is not None else DETAIL_REGISTERS + ([1200,1700,1702] if self.model == 'P40' else [])
+        raw = {}
+        # Slow optional registers must not block fresh current measurements or
+        # watchdog writes. The controller rotates small groups on later ticks.
+        try:
+            async with asyncio.timeout(0.6 if detail_registers is not None else 20):
+                for register in registers:
+                    value = await self.optional32(register)
+                    if value is not None:
+                        raw[register] = value
+        except TimeoutError:
+            pass
+        fields = {
+            'energy_kwh':(1036, lambda x:x/10_000), 'session_kwh':(1502, lambda x:x/10_000),
+            'serial':(1014, int), 'product_raw':(1016, int), 'firmware_raw':(1018, int),
+            'firmware':(1018, self.firmware_version), 'power_factor_pct':(1046, lambda x:x/10),
+            'device_limit_a':(1100, lambda x:x/1000), 'phase_switch_source':(1550, int),
+            'phase_count':(1552, int), 'rfid_uid':(1500, lambda x:f'{x:08X}'),
+            'failsafe_current_a':(1600, lambda x:x/1000), 'failsafe_timeout_s':(1602, int),
+            'fast_charging':(1200, bool), 'hardware_revision':(1700, int), 'meter_hardware_revision':(1702, int),
+        }
+        data.update({key:convert(raw[register]) for key,(register,convert) in fields.items() if register in raw})
+        if all(r in raw for r in [1040,1042,1044]):
+            data['voltages_v'] = [raw[r] for r in [1040,1042,1044]]
         return data
 
     async def set_limit(self, amps):
@@ -85,6 +92,12 @@ class KebaModbus:
 
     async def configure_failsafe(self, timeout=10):
         if not 5<=timeout<=600:raise ValueError('Ungültiger Timeout')
+        # Reconnecting to an already configured device must not generate an
+        # artificial 0-A pulse. Verify the safe fallback before reusing it.
+        current, actual_timeout = await self.read32(1600), await self.read32(1602)
+        if (current, actual_timeout) == (0, timeout):
+            await self.refresh_failsafe(timeout)
+            return
         await self.set_limit(0)
         await self.write16(5016,0)
         await self.refresh_failsafe(timeout)
