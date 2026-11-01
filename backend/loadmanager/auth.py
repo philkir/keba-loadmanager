@@ -120,9 +120,9 @@ class AuthStore:
         return [dict(zip(('id', 'username', 'role', 'created_at'), row)) for row in rows]
 
     def login_allowed(self, key):
-        cutoff = time.time() - 15 * 60
+        cutoff = time.time() - 60
         with self._db() as db:
-            db.execute('DELETE FROM login_attempts WHERE attempted_at < ?', (cutoff,))
+            db.execute('DELETE FROM login_attempts WHERE attempted_at <= ?', (cutoff,))
             return db.execute('SELECT count(*) FROM login_attempts WHERE key=?', (key,)).fetchone()[0] < 5
 
     def failed_login(self, key):

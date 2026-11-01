@@ -128,7 +128,7 @@ async def auth_login(request: Request):
         return JSONResponse({'detail': 'Ungültiger Ursprung.'}, status_code=403)
     key = client_key(request)
     if not request.app.state.auth.login_allowed(key):
-        return JSONResponse({'detail': 'Zu viele Anmeldeversuche. Bitte in 15 Minuten erneut versuchen.'}, status_code=429)
+        return JSONResponse({'detail': 'Zu viele Anmeldeversuche. Bitte in einer Minute erneut versuchen.'}, status_code=429)
     body = await auth_body(request)
     user, token = request.app.state.auth.login(body.get('username', ''), body.get('password', ''))
     if not user:

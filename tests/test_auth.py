@@ -80,6 +80,22 @@ class AuthTests(unittest.TestCase):
         self.assertNotIn(self.account['password'], stored_hash)
         self.assertNotEqual(stored_session, token)
 
+    def test_login_limit_expires_after_one_minute(self):
+        self.setup_account()
+        self.post('/auth/logout', {})
+        with patch('loadmanager.auth.time.time', return_value=2000000000) as clock:
+            for _ in range(5):
+                response = self.post('/auth/login', {**self.account, 'password': 'wrong-password-123'})
+                self.assertEqual(response.status_code, 401)
+            blocked = self.post('/auth/login', self.account)
+            self.assertEqual(blocked.status_code, 429)
+            self.assertEqual(blocked.json()['detail'],
+                             'Zu viele Anmeldeversuche. Bitte in einer Minute erneut versuchen.')
+            clock.return_value = 2000000059.999
+            self.assertEqual(self.post('/auth/login', self.account).status_code, 429)
+            clock.return_value = 2000000060
+            self.assertEqual(self.post('/auth/login', self.account).status_code, 200)
+
     def test_real_hashing_accepts_password_manager_characters_and_lengths(self):
         for password in ('X!9+aB#2_cD?', 'ß🔒A!"\\ ' * 32, 'p' * 256):
             with self.subTest(length=len(password)):
